@@ -117,7 +117,11 @@ namespace chroma {
     /* ------------------------------------------------------------------ */
 
     namespace sync {
-        struct Pair { u32 o[4]; u32 n[4]; };
+        struct Pair {
+            u32 o[4]; u32 n[4];   /* float の RGB(A) */
+            u16 ho[3]; u16 hn[3]; /* 半精度(16bit)の RGB。GPU 向けにこの形で持っている場所もある */
+            bool half;            /* 半精度でも探すか */
+        };
         constexpr int MaxPairs = teamcolor::TeamCount * SetCount * BlockColors;
         constexpr size_t ChunkBytes   = 256u << 10;  /* 256KB ずつ */
         constexpr u64    TicksPerFrame = 19200000ull / 1000ull;  /* 1フレームあたり最大 1ms (19.2MHz) */
@@ -125,12 +129,15 @@ namespace chroma {
         Pair      g_Pairs[MaxPairs];
         int       g_PairCount = 0;
         u64       g_Bloom[65536 / 64];
+        u64       g_Bloom16[65536 / 64];
+        int       g_Pass = 0;  /* 0: 普通のメモリ, 1: キャッシュされないメモリ(遅いので後回し) */
         bool      g_Active = false;
         uintptr_t g_Next = 0, g_Cur = 0, g_End = 0;
         u64       g_Total = 0, g_Done = 0;
         int       g_Replaced = 0, g_LastReplaced = -1;
 
         u32 Bits(float f) { u32 u; std::memcpy(&u, &f, 4); return u; }
+        u16 HalfBits(float f) { __fp16 h = (__fp16) f; u16 u; std::memcpy(&u, &h, 2); return u; }
         u32 Hash(u32 w) { return (w ^ (w >> 16)) & 0xFFFF; }
 
         bool IsTrivial(const teamcolor::Color4f& c) {
@@ -140,8 +147,9 @@ namespace chroma {
 
         bool Scannable(const MemoryInfo& mi) {
             if ((mi.perm & Perm_Rw) != Perm_Rw) return false;
-            /* キャッシュされないメモリ(GPU用など)は読むのが非常に遅いので飛ばす */
-            if (mi.attr & MemAttr_IsUncached) return false;
+            /* キャッシュされないメモリ(GPU用など)は読むのが遅いので、2周目にまわす */
+            bool uncached = (mi.attr & MemAttr_IsUncached) != 0;
+            if (uncached != (g_Pass == 1)) return false;
             switch (mi.type & MemState_Type) {
                 case MemType_Normal: case MemType_CodeMutable: case MemType_Heap:
                 case MemType_ModuleCodeMutable: case MemType_MappedMemory:
@@ -170,24 +178,34 @@ namespace chroma {
 
         u64 CountTotal() {
             u64 total = 0;
-            uintptr_t next = 0;
-            while (true) {
-                MemoryInfo mi{}; u32 pi;
-                if (R_FAILED(svcQueryMemory(&mi, &pi, next))) break;
-                uintptr_t end = mi.addr + mi.size;
-                if (mi.size == 0 || end <= next) break;
-                next = end;
-                if (Scannable(mi)) total += mi.size;
+            int savedPass = g_Pass;
+            for (g_Pass = 0; g_Pass < 2; g_Pass++) {
+                uintptr_t next = 0;
+                while (true) {
+                    MemoryInfo mi{}; u32 pi;
+                    if (R_FAILED(svcQueryMemory(&mi, &pi, next))) break;
+                    uintptr_t end = mi.addr + mi.size;
+                    if (mi.size == 0 || end <= next) break;
+                    next = end;
+                    if (Scannable(mi)) total += mi.size;
+                }
             }
+            g_Pass = savedPass;
             return total;
         }
 
         void Start() {
             std::memset(g_Bloom, 0, sizeof(g_Bloom));
+            std::memset(g_Bloom16, 0, sizeof(g_Bloom16));
             for (int i = 0; i < g_PairCount; i++) {
                 u32 h = Hash(g_Pairs[i].o[0]);
                 g_Bloom[h >> 6] |= 1ull << (h & 63);
+                if (g_Pairs[i].half) {
+                    u32 h16 = g_Pairs[i].ho[0];
+                    g_Bloom16[h16 >> 6] |= 1ull << (h16 & 63);
+                }
             }
+            g_Pass = 0;
             g_Next = 0; g_Cur = g_End = 0;
             g_Total = CountTotal(); g_Done = 0; g_Replaced = 0;
             g_Active = g_PairCount > 0;
@@ -197,7 +215,6 @@ namespace chroma {
         void ScanRange(uintptr_t start, size_t bytes) {
             volatile u32* p = reinterpret_cast<volatile u32*>(start);
             size_t n = bytes / 4;
-            if (n < 3) return;
             for (size_t i = 0; i + 2 < n; i++) {
                 u32 w = p[i];
                 u32 h = Hash(w);
@@ -211,6 +228,22 @@ namespace chroma {
                     break;
                 }
             }
+
+            /* 半精度(16bit)の RGB */
+            volatile u16* q = reinterpret_cast<volatile u16*>(start);
+            size_t m = bytes / 2;
+            for (size_t i = 0; i + 2 < m; i++) {
+                u16 w = q[i];
+                if (!(g_Bloom16[w >> 6] & (1ull << (w & 63)))) continue;
+                for (int k = 0; k < g_PairCount; k++) {
+                    const Pair& pr = g_Pairs[k];
+                    if (!pr.half || w != pr.ho[0] || q[i + 1] != pr.ho[1] || q[i + 2] != pr.ho[2]) continue;
+                    q[i] = pr.hn[0]; q[i + 1] = pr.hn[1]; q[i + 2] = pr.hn[2];
+                    g_Replaced++;
+                    i += 2;
+                    break;
+                }
+            }
         }
 
         void Step() {
@@ -218,6 +251,11 @@ namespace chroma {
             u64 start = svcGetSystemTick();
             while (svcGetSystemTick() - start < TicksPerFrame) {
                 if (g_Cur >= g_End && !NextRegion()) {
+                    if (g_Pass == 0) {  /* 普通のメモリが終わったら、キャッシュされないメモリへ */
+                        g_Pass = 1;
+                        g_Next = 0; g_Cur = g_End = 0;
+                        continue;
+                    }
                     g_Active = false;
                     g_LastReplaced = g_Replaced;
                     return;
@@ -252,6 +290,14 @@ namespace chroma {
                     sync::Pair& pr = sync::g_Pairs[sync::g_PairCount++];
                     pr.o[0] = sync::Bits(o.r); pr.o[1] = sync::Bits(o.g); pr.o[2] = sync::Bits(o.b); pr.o[3] = sync::Bits(o.a);
                     pr.n[0] = sync::Bits(n.r); pr.n[1] = sync::Bits(n.g); pr.n[2] = sync::Bits(n.b); pr.n[3] = sync::Bits(n.a);
+                    pr.ho[0] = sync::HalfBits(o.r); pr.ho[1] = sync::HalfBits(o.g); pr.ho[2] = sync::HalfBits(o.b);
+                    pr.hn[0] = sync::HalfBits(n.r); pr.hn[1] = sync::HalfBits(n.g); pr.hn[2] = sync::HalfBits(n.b);
+                    /* 16bit にすると同じ値になる/0 と 1 だけになる色は紛らわしいので半精度では探さない */
+                    {
+                        auto triv = [](u16 v) { return v == 0x0000 || v == 0x3C00; };
+                        bool same = pr.ho[0] == pr.hn[0] && pr.ho[1] == pr.hn[1] && pr.ho[2] == pr.hn[2];
+                        pr.half = !same && !(triv(pr.ho[0]) && triv(pr.ho[1]) && triv(pr.ho[2]));
+                    }
                 }
                 SnapshotBlock(team, set);
             }
