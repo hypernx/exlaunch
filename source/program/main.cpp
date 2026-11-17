@@ -13,13 +13,93 @@
 
 namespace chroma {
 
-    /* メニューで変更する設定値。ゲームへの反映は未実装。 */
-    struct Settings {
-        bool  customInk   = false;
-        float inkColor[3] = { 1.0f, 0.35f, 0.0f };
+    /*
+     * チームカラー表 (main 1.0 系 BuildID 28c4287a 専用のオフセット)
+     *
+     *   *(main + 0x6056160)            = チームカラー管理オブジェクト
+     *   obj + 0x2b8 + team * 0x12c     = チームごとの色ブロック
+     *   block + kind * 0x10            = sead::Color4f (kind は 0..16 の色バリエーション)
+     *
+     * 根拠: シェーダーの my_team_color 系パラメータを設定する処理 (0x1344b00) が、
+     *       色の取得関数 (0x1345e58) を通してこの表を読んでいる。
+     */
+    namespace teamcolor {
+        constexpr uintptr_t InstanceOffset = 0x6056160;
+        constexpr uintptr_t TableOffset    = 0x2b8;
+        constexpr size_t    TeamStride     = 0x12c;
+        constexpr int       KindCount      = 17;
+        constexpr int       TeamCount      = 2; /* 0 = Alpha, 1 = Bravo */
+
+        struct Color4f { float r, g, b, a; };
+
+        Color4f* GetTeamBlock(int team) {
+            uintptr_t instance = *reinterpret_cast<uintptr_t*>(exl::util::modules::GetTargetOffset(InstanceOffset));
+            if (instance == 0) return nullptr;
+            return reinterpret_cast<Color4f*>(instance + TableOffset + team * TeamStride);
+        }
+    }
+
+    struct TeamOverride {
+        const char* name;
+        bool  enabled  = false;
+        float color[3] = { 1.0f, 1.0f, 1.0f };
+        /* 有効にした時点の元の色(無効に戻すときに使う) */
+        bool  hasBackup = false;
+        teamcolor::Color4f backup[teamcolor::KindCount] = {};
     };
 
-    Settings g_Settings;
+    TeamOverride g_Teams[teamcolor::TeamCount] = {
+        { "Alpha", false, { 1.00f, 0.35f, 0.00f } },
+        { "Bravo", false, { 0.10f, 0.40f, 1.00f } },
+    };
+
+    /* 毎フレーム呼ぶ。有効なチームの色を書き換え、無効にしたら元に戻す。 */
+    void ApplyTeamColors() {
+        for (int team = 0; team < teamcolor::TeamCount; team++) {
+            TeamOverride& o = g_Teams[team];
+            teamcolor::Color4f* block = teamcolor::GetTeamBlock(team);
+            if (block == nullptr) continue;
+
+            if (o.enabled) {
+                if (!o.hasBackup) {
+                    for (int k = 0; k < teamcolor::KindCount; k++) o.backup[k] = block[k];
+                    o.hasBackup = true;
+                }
+                for (int k = 0; k < teamcolor::KindCount; k++) {
+                    block[k].r = o.color[0];
+                    block[k].g = o.color[1];
+                    block[k].b = o.color[2];
+                    /* アルファ(不透明度)は元のまま */
+                }
+            } else if (o.hasBackup) {
+                /* ゲームがまだ書き換えていなければ(自分の色のままなら)元に戻す */
+                if (block[0].r == o.color[0] && block[0].g == o.color[1] && block[0].b == o.color[2]) {
+                    for (int k = 0; k < teamcolor::KindCount; k++) block[k] = o.backup[k];
+                }
+                o.hasBackup = false;
+            }
+        }
+    }
+
+    void DrawTeamRow(int team) {
+        TeamOverride& o = g_Teams[team];
+        ImGui::PushID(team);
+
+        teamcolor::Color4f* block = teamcolor::GetTeamBlock(team);
+        ImVec4 current = block ? ImVec4(block[0].r, block[0].g, block[0].b, 1.0f) : ImVec4(0, 0, 0, 1);
+
+        ImGui::Text("%s team", o.name);
+        ImGui::SameLine();
+        ImGui::ColorButton("##current", current, ImGuiColorEditFlags_NoTooltip, ImVec2(22, 22));
+        ImGui::SameLine();
+        ImGui::TextDisabled("now");
+
+        ImGui::Checkbox("Override", &o.enabled);
+        ImGui::ColorEdit3("RGB", o.color,
+                          ImGuiColorEditFlags_Uint8 | ImGuiColorEditFlags_DisplayRGB | ImGuiColorEditFlags_InputRGB);
+
+        ImGui::PopID();
+    }
 
     void ApplyStyle() {
         ImGuiStyle& style = ImGui::GetStyle();
@@ -62,7 +142,9 @@ namespace chroma {
         ApplyStyle();
     }
 
-    void OnNewFrame() {}
+    void OnNewFrame() {
+        ApplyTeamColors();
+    }
 
     void OnRender() {
         ImGui::SetNextWindowPos(ImVec2(32, 32), ImGuiCond_FirstUseEver);
@@ -73,9 +155,9 @@ namespace chroma {
             ImGui::Separator();
 
             if (ImGui::CollapsingHeader("Ink", ImGuiTreeNodeFlags_DefaultOpen)) {
-                ImGui::Checkbox("Custom ink color", &g_Settings.customInk);
-                ImGui::ColorEdit3("Color", g_Settings.inkColor);
-                ImGui::TextDisabled("(not applied to the game yet)");
+                DrawTeamRow(0);
+                ImGui::Separator();
+                DrawTeamRow(1);
             }
         }
         ImGui::End();
