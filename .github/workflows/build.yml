@@ -17,9 +17,15 @@ jobs:
           dkp-pacman -S --noconfirm switch-tools || true
       - name: Build plugin
         run: make -j"$(nproc)"
+      # SDカードのルートにそのまま貼り付けられる形にまとめる
+      - name: Package for SD card
+        run: |
+          PROGRAM_ID=$(grep -E '^PROGRAM_ID' config.mk | sed -E 's/.*:= *//' | tr -d '[:space:]')
+          DEST=sd/atmosphere/contents/${PROGRAM_ID}/exefs
+          mkdir -p "$DEST"
+          cp deploy/subsdk9 deploy/main.npdm "$DEST/"
+          find sd -type f
       - uses: actions/upload-artifact@v4
         with:
           name: splatoon3-plugin
-          path: |
-            deploy/subsdk9
-            deploy/main.npdm
+          path: sd/
