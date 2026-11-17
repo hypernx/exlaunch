@@ -18,6 +18,8 @@
 
 namespace chroma {
 
+    float Clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
+
     /*
      * チームカラー表 (main 1.0 系 BuildID 28c4287a 専用のオフセット)
      *
@@ -89,6 +91,171 @@ namespace chroma {
         return block ? reinterpret_cast<teamcolor::Color4f*>(reinterpret_cast<u8*>(block) + 0x110) : nullptr;
     }
 
+    /*
+     * 「いまゲームの中にコピーされている色」の控え。
+     * キャラや地面は、試合の開始時に表から色を写して使い続けるので、
+     * 表を書き換えただけでは変わらない。そこで、この控えと同じ値を
+     * ゲームのメモリから探して、新しい色に置き換える(メモリ同期)。
+     */
+    constexpr int BlockColors = 18;   /* 17 バリエーション + 基本色(+0x110) */
+
+    struct Committed {
+        bool valid = false;
+        teamcolor::Color4f colors[BlockColors]{};
+    };
+    Committed g_Committed[teamcolor::TeamCount][SetCount];
+
+    void SnapshotBlock(int team, int set) {
+        teamcolor::Color4f* block = GetBlock(team, set);
+        if (block == nullptr) return;
+        for (int k = 0; k < BlockColors; k++) g_Committed[team][set].colors[k] = block[k];
+        g_Committed[team][set].valid = true;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*  メモリ同期(少しずつ、毎フレーム数MBずつ探して置き換える)         */
+    /* ------------------------------------------------------------------ */
+
+    namespace sync {
+        struct Pair { u32 o[4]; u32 n[4]; };
+        constexpr int MaxPairs = teamcolor::TeamCount * SetCount * BlockColors;
+        constexpr size_t BytesPerFrame = 12u << 20;
+
+        Pair      g_Pairs[MaxPairs];
+        int       g_PairCount = 0;
+        u64       g_Bloom[65536 / 64];
+        bool      g_Active = false;
+        uintptr_t g_Next = 0, g_Cur = 0, g_End = 0;
+        u64       g_Total = 0, g_Done = 0;
+        int       g_Replaced = 0, g_LastReplaced = -1;
+
+        u32 Bits(float f) { u32 u; std::memcpy(&u, &f, 4); return u; }
+        u32 Hash(u32 w) { return (w ^ (w >> 16)) & 0xFFFF; }
+
+        bool IsTrivial(const teamcolor::Color4f& c) {
+            auto t = [](float v) { return v == 0.0f || v == 1.0f; };
+            return t(c.r) && t(c.g) && t(c.b);
+        }
+
+        bool Scannable(const MemoryInfo& mi) {
+            if ((mi.perm & Perm_Rw) != Perm_Rw) return false;
+            switch (mi.type & MemState_Type) {
+                case MemType_Normal: case MemType_CodeMutable: case MemType_Heap:
+                case MemType_ModuleCodeMutable: case MemType_MappedMemory:
+                case MemType_TransferMem: case MemType_TransferMemIsolated:
+                    break;
+                default:
+                    return false;
+            }
+            /* 自分自身(このプラグイン)は除く */
+            const auto& self = exl::util::GetSelfModuleInfo().m_Total;
+            if (mi.addr < self.GetEnd() && mi.addr + mi.size > self.m_Start) return false;
+            return true;
+        }
+
+        /* 次に調べるメモリ領域へ進む。無ければ false */
+        bool NextRegion() {
+            while (true) {
+                MemoryInfo mi{}; u32 pi;
+                if (R_FAILED(svcQueryMemory(&mi, &pi, g_Next))) return false;
+                uintptr_t end = mi.addr + mi.size;
+                if (mi.size == 0 || end <= g_Next) return false;  /* 末尾 */
+                g_Next = end;
+                if (Scannable(mi)) { g_Cur = mi.addr; g_End = end; return true; }
+            }
+        }
+
+        u64 CountTotal() {
+            u64 total = 0;
+            uintptr_t next = 0;
+            while (true) {
+                MemoryInfo mi{}; u32 pi;
+                if (R_FAILED(svcQueryMemory(&mi, &pi, next))) break;
+                uintptr_t end = mi.addr + mi.size;
+                if (mi.size == 0 || end <= next) break;
+                next = end;
+                if (Scannable(mi)) total += mi.size;
+            }
+            return total;
+        }
+
+        void Start() {
+            std::memset(g_Bloom, 0, sizeof(g_Bloom));
+            for (int i = 0; i < g_PairCount; i++) {
+                u32 h = Hash(g_Pairs[i].o[0]);
+                g_Bloom[h >> 6] |= 1ull << (h & 63);
+            }
+            g_Next = 0; g_Cur = g_End = 0;
+            g_Total = CountTotal(); g_Done = 0; g_Replaced = 0;
+            g_Active = g_PairCount > 0;
+        }
+
+        /* RGB の3つが一致したら RGB だけ書き換える(アルファはそのまま) */
+        void ScanRange(uintptr_t start, size_t bytes) {
+            volatile u32* p = reinterpret_cast<volatile u32*>(start);
+            size_t n = bytes / 4;
+            if (n < 3) return;
+            for (size_t i = 0; i + 2 < n; i++) {
+                u32 w = p[i];
+                u32 h = Hash(w);
+                if (!(g_Bloom[h >> 6] & (1ull << (h & 63)))) continue;
+                for (int k = 0; k < g_PairCount; k++) {
+                    const Pair& pr = g_Pairs[k];
+                    if (w != pr.o[0] || p[i + 1] != pr.o[1] || p[i + 2] != pr.o[2]) continue;
+                    p[i] = pr.n[0]; p[i + 1] = pr.n[1]; p[i + 2] = pr.n[2];
+                    g_Replaced++;
+                    i += 2;
+                    break;
+                }
+            }
+        }
+
+        void Step() {
+            if (!g_Active) return;
+            size_t budget = BytesPerFrame;
+            while (budget > 0) {
+                if (g_Cur >= g_End && !NextRegion()) {
+                    g_Active = false;
+                    g_LastReplaced = g_Replaced;
+                    return;
+                }
+                /* 直前に領域が消えていないか確認してから読む */
+                MemoryInfo mi{}; u32 pi;
+                if (R_FAILED(svcQueryMemory(&mi, &pi, g_Cur)) || !Scannable(mi)) { g_Cur = g_End; continue; }
+                uintptr_t limit = mi.addr + mi.size < g_End ? mi.addr + mi.size : g_End;
+                size_t len = limit - g_Cur;
+                if (len > budget) len = budget;
+                ScanRange(g_Cur, len);
+                g_Cur += len; g_Done += len; budget -= len;
+            }
+        }
+
+        float Progress() { return g_Total ? Clamp01((float) g_Done / (float) g_Total) : 1.0f; }
+    }
+
+    /* 控え(古い色) → 表の今の色 の対応を作って、メモリ同期を始める */
+    void StartSync() {
+        sync::g_PairCount = 0;
+        for (int team = 0; team < teamcolor::TeamCount; team++) {
+            for (int set = 0; set < SetCount; set++) {
+                Committed& c = g_Committed[team][set];
+                teamcolor::Color4f* block = GetBlock(team, set);
+                if (!c.valid || block == nullptr) continue;
+                for (int k = 0; k < BlockColors; k++) {
+                    const teamcolor::Color4f& o = c.colors[k];
+                    const teamcolor::Color4f& n = block[k];
+                    if (o.r == n.r && o.g == n.g && o.b == n.b) continue;
+                    if (sync::IsTrivial(o)) continue;  /* (1,0,0) などは他のデータと紛らわしいので触らない */
+                    sync::Pair& pr = sync::g_Pairs[sync::g_PairCount++];
+                    pr.o[0] = sync::Bits(o.r); pr.o[1] = sync::Bits(o.g); pr.o[2] = sync::Bits(o.b); pr.o[3] = sync::Bits(o.a);
+                    pr.n[0] = sync::Bits(n.r); pr.n[1] = sync::Bits(n.g); pr.n[2] = sync::Bits(n.b); pr.n[3] = sync::Bits(n.a);
+                }
+                SnapshotBlock(team, set);
+            }
+        }
+        sync::Start();
+    }
+
     /* フックから呼ばれる: ゲームが色をセットするとき、上書き中なら自分の色にすり替える */
     void OnSetBlock(teamcolor::Color4f* block, const teamcolor::Color4f* color, u64 a, u64 b, float f) {
         for (int team = 0; team < teamcolor::TeamCount; team++) {
@@ -104,9 +271,11 @@ namespace chroma {
                 if (o.enabled) {
                     teamcolor::Color4f mine{ o.color[0], o.color[1], o.color[2], color->a };
                     g_OrigSetBlock(block, &mine, a, b, f);
-                    return;
+                } else {
+                    g_OrigSetBlock(block, color, a, b, f);
                 }
-                g_OrigSetBlock(block, color, a, b, f);
+                /* 試合の準備でセットされた色 = これからゲームが写す色 */
+                SnapshotBlock(team, set);
                 return;
             }
         }
@@ -121,6 +290,7 @@ namespace chroma {
             BlockState& s = g_Blocks[team][set];
             teamcolor::Color4f* block = GetBlock(team, set);
             if (!s.valid || block == nullptr) continue;
+            if (!g_Committed[team][set].valid) SnapshotBlock(team, set);
             if (o.enabled) {
                 teamcolor::Color4f mine{ o.color[0], o.color[1], o.color[2], s.original.a };
                 g_OrigSetBlock(block, &mine, s.a, s.b, s.f);
@@ -130,10 +300,14 @@ namespace chroma {
         }
     }
 
-    /* 毎フレーム呼ぶ。設定が変わったチームだけ作り直す。 */
-    void ApplyTeamColors() {
+    /* 毎フレーム呼ぶ。表はすぐ作り直し、手が止まったらメモリ同期 */
+    void ApplyTeamColors(float dt) {
         static bool  lastEnabled[teamcolor::TeamCount] = {};
         static float lastColor[teamcolor::TeamCount][3] = {};
+        static float idle = 0.0f;
+        static bool  pending = false;
+
+        bool anyChange = false;
         for (int team = 0; team < teamcolor::TeamCount; team++) {
             const TeamOverride& o = g_Teams[team];
             bool changed = o.enabled != lastEnabled[team];
@@ -145,7 +319,18 @@ namespace chroma {
             ReapplyTeam(team);
             lastEnabled[team] = o.enabled;
             for (int c = 0; c < 3; c++) lastColor[team][c] = o.color[c];
+            anyChange = true;
         }
+
+        if (anyChange) { pending = true; idle = 0.0f; }
+        else idle += dt;
+
+        /* 0.3秒操作が止まって、前の同期が終わっていたら同期する */
+        if (pending && idle > 0.3f && !sync::g_Active) {
+            pending = false;
+            StartSync();
+        }
+        sync::Step();
     }
 
     /* ------------------------------------------------------------------ */
@@ -173,7 +358,6 @@ namespace chroma {
         }
     }
 
-    float Clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
 
     /* イージング: ぽよんと跳ねる */
     float EaseOutBack(float t) {
@@ -220,7 +404,7 @@ namespace chroma {
     /* ------------------------------------------------------------------ */
 
     namespace intro {
-        constexpr float Duration = 3.2f;   /* ロードの長さ(秒) */
+        constexpr float Duration = 2.4f;   /* ロードの長さ(秒) */
         constexpr float FadeOut  = 0.45f;  /* 消えるまで(秒) */
 
         float g_Time   = 0.0f;
@@ -240,75 +424,41 @@ namespace chroma {
                 return false;
             }
 
-            float fade = t > Duration ? 1.0f - (t - Duration) / FadeOut : 1.0f;
+            /* ふわっと出て、ふわっと消える */
+            float fade = t > Duration ? 1.0f - (t - Duration) / FadeOut : Clamp01(t / 0.25f);
             ImDrawList* dl = ImGui::GetForegroundDrawList();
             ImVec2 ds = io.DisplaySize;
-            ImVec2 mid(ds.x * 0.5f, ds.y * 0.5f);
             float unit = ds.y / 720.0f;
 
-            /* 背景: 濃い紫のグラデーション */
-            dl->AddRectFilledMultiColor(ImVec2(0, 0), ds,
-                                        pal::WithAlpha(IM_COL32(40, 10, 70, 255), 0.92f * fade),
-                                        pal::WithAlpha(IM_COL32(15, 30, 80, 255), 0.92f * fade),
-                                        pal::WithAlpha(IM_COL32(60, 10, 60, 255), 0.92f * fade),
-                                        pal::WithAlpha(IM_COL32(10, 10, 30, 255), 0.92f * fade));
+            /* 画面の真ん中に小さなカード */
+            float cw = 320 * unit, ch = 120 * unit;
+            float pop = EaseOutBack(t / 0.4f);
+            ImVec2 c(ds.x * 0.5f, ds.y * 0.5f);
+            ImVec2 p0(c.x - cw * 0.5f * pop, c.y - ch * 0.5f * pop), p1(c.x + cw * 0.5f * pop, c.y + ch * 0.5f * pop);
+            dl->AddRectFilled(p0, p1, pal::WithAlpha(IM_COL32(30, 14, 58, 255), 0.92f * fade), 14 * unit);
+            dl->AddRect(p0, p1, pal::WithAlpha(pal::Pink, fade), 14 * unit, 0, 3 * unit);
+            if (pop < 0.9f) return true;
 
-            /* 順番に広がるインクのしぶき */
-            struct SplatDef { float x, y, r, at; int color; };
-            static const SplatDef splats[] = {
-                { 0.14f, 0.22f, 70, 0.05f, 0 }, { 0.86f, 0.18f, 60, 0.25f, 2 },
-                { 0.10f, 0.80f, 85, 0.45f, 1 }, { 0.88f, 0.78f, 75, 0.65f, 3 },
-                { 0.32f, 0.10f, 38, 0.85f, 4 }, { 0.70f, 0.90f, 45, 1.00f, 0 },
-                { 0.50f, 0.85f, 30, 1.20f, 2 }, { 0.62f, 0.12f, 32, 1.35f, 1 },
-            };
-            for (int i = 0; i < (int) (sizeof(splats) / sizeof(splats[0])); i++) {
-                const SplatDef& s = splats[i];
-                float k = EaseOutBack((t - s.at) / 0.5f);
-                if (k <= 0.0f) continue;
-                DrawSplat(dl, ImVec2(ds.x * s.x, ds.y * s.y), s.r * unit * k,
-                          pal::WithAlpha(pal::Cycle[s.color], 0.85f * fade), i + 1);
-            }
+            /* ロゴ */
+            DrawBouncyTitle(dl, "CHROMA RUSH", ImVec2(c.x, c.y - 22 * unit), 32 * unit, t, fade);
 
-            /* タイトル: ぽよんと出てきて、文字が波打つ */
-            float pop = EaseOutBack((t - 0.2f) / 0.7f);
-            if (pop > 0.0f) {
-                DrawBouncyTitle(dl, "CHROMA RUSH", ImVec2(mid.x, mid.y - 40 * unit), 84.0f * unit * pop, t, fade);
-            }
-
-            /* サブタイトル */
-            float subA = Clamp01((t - 0.9f) / 0.4f) * fade;
-            if (subA > 0.0f) {
-                const char* sub = "~ splash your own colors ~";
-                float sz = 22.0f * unit;
-                ImVec2 tsz = ImGui::GetFont()->CalcTextSizeA(sz, FLT_MAX, 0.0f, sub);
-                dl->AddText(ImGui::GetFont(), sz, ImVec2(mid.x - tsz.x * 0.5f, mid.y + 20 * unit),
-                            pal::WithAlpha(pal::White, subA), sub);
-            }
-
-            /* ローディングバー: インクが流れ込むように伸びる */
-            float barW = 420.0f * unit, barH = 22.0f * unit;
-            ImVec2 b0(mid.x - barW * 0.5f, mid.y + 80 * unit), b1(mid.x + barW * 0.5f, b0.y + barH);
-            float prog = Clamp01(t / (Duration - 0.3f));
+            /* ローディングバー */
+            float bw = 240 * unit, bh = 12 * unit;
+            ImVec2 b0(c.x - bw * 0.5f, c.y + 12 * unit), b1(c.x + bw * 0.5f, b0.y + bh);
+            float prog = Clamp01(t / (Duration - 0.2f));
             prog = 1.0f - (1.0f - prog) * (1.0f - prog);
-            dl->AddRectFilled(b0, b1, pal::WithAlpha(pal::Ink, 0.9f * fade), barH * 0.5f);
-            if (prog > 0.02f) {
-                ImVec2 f1(b0.x + barW * prog, b1.y);
-                dl->AddRectFilledMultiColor(ImVec2(b0.x + barH * 0.25f, b0.y + 3 * unit), ImVec2(f1.x - barH * 0.25f, f1.y - 3 * unit),
+            dl->AddRectFilled(b0, b1, pal::WithAlpha(pal::Ink, 0.9f * fade), bh * 0.5f);
+            if (prog > 0.03f) {
+                dl->AddRectFilledMultiColor(ImVec2(b0.x + 2 * unit, b0.y + 2 * unit), ImVec2(b0.x + (bw - 2 * unit) * prog, b1.y - 2 * unit),
                                             pal::WithAlpha(pal::Pink, fade), pal::WithAlpha(pal::Lime, fade),
                                             pal::WithAlpha(pal::Lime, fade), pal::WithAlpha(pal::Pink, fade));
-                /* 先頭の丸いインク */
-                dl->AddCircleFilled(ImVec2(f1.x - barH * 0.3f, (b0.y + b1.y) * 0.5f), barH * 0.55f, pal::WithAlpha(pal::Lime, fade), 20);
             }
-            dl->AddRect(b0, b1, pal::WithAlpha(pal::White, 0.8f * fade), barH * 0.5f, 0, 2.0f * unit);
 
-            /* LOADING... + パーセント */
-            char label[32];
-            int dots = ((int) (t * 3.0f)) % 4;
-            snprintf(label, sizeof(label), "LOADING%.*s  %d%%", dots, "...", (int) (prog * 100.0f));
-            float lsz = 20.0f * unit;
-            ImVec2 lts = ImGui::GetFont()->CalcTextSizeA(lsz, FLT_MAX, 0.0f, label);
-            dl->AddText(ImGui::GetFont(), lsz, ImVec2(mid.x - lts.x * 0.5f, b1.y + 12 * unit),
-                        pal::WithAlpha(pal::Cyan, fade), label);
+            char label[24];
+            snprintf(label, sizeof(label), "LOADING %d%%", (int) (prog * 100.0f));
+            float ls = 14 * unit;
+            float lw = ImGui::GetFont()->CalcTextSizeA(ls, FLT_MAX, 0.0f, label).x;
+            dl->AddText(ImGui::GetFont(), ls, ImVec2(c.x - lw * 0.5f, b1.y + 8 * unit), pal::WithAlpha(pal::Cyan, fade), label);
 
             return true;
         }
@@ -350,7 +500,7 @@ namespace chroma {
     struct Trap {
         ImVec2 pos;    /* 左上(下の辺の左端の x) */
         float  w, h;   /* 下の辺の幅、高さ */
-        float  inset;  /* 上の辺の左右の食い込み */
+        float  inset;  /* 上の辺の左右の食い込み(0 で長方形) */
 
         /* 高さ y での左右の端 */
         float Left(float y) const  { return pos.x + inset * (1.0f - (y - pos.y) / h); }
@@ -482,7 +632,7 @@ namespace chroma {
 
     /* メニューを閉じているときの小さなタブ */
     void DrawClosedTab(ImDrawList* dl, float unit, float time) {
-        Trap t{ ImVec2(24 * unit, 18 * unit), 250 * unit, 54 * unit, 22 * unit };
+        Trap t{ ImVec2(24 * unit, 18 * unit), 250 * unit, 54 * unit, 0.0f };  /* 長方形 */
         FillTrap(dl, ImVec2(t.Left(t.pos.y), t.pos.y), ImVec2(t.Right(t.pos.y), t.pos.y),
                  ImVec2(t.pos.x + t.w, t.pos.y + t.h), ImVec2(t.pos.x, t.pos.y + t.h), pal::WithAlpha(pal::Ink, 0.75f));
         FillBand(dl, t, t.pos.y, t.pos.y + 6 * unit, 0, pal::Pink);
@@ -540,13 +690,13 @@ namespace chroma {
         float rowH = 50 * unit;
         float headerH = 78 * unit;
         float previewH = menu::g_Page == Page::Color ? 96 * unit : 0.0f;
-        float footerH = 40 * unit;
+        float footerH = (sync::g_Active ? 64 : 40) * unit;
         float h = headerH + rowH * count + previewH + footerH + 16 * unit;
 
         /* 開くとき: 上からぽよんと落ちてくる */
         float open = EaseOutBack(menu::g_OpenAnim);
         float drop = (1.0f - open) * -120 * unit;
-        Trap t{ ImVec2(36 * unit, 30 * unit + drop), 540 * unit, h, 70 * unit };
+        Trap t{ ImVec2(36 * unit, 30 * unit + drop), 540 * unit, h, 0.0f };  /* 長方形(上と下が同じ長さ) */
 
         ImVec2 tl(t.Left(t.pos.y), t.pos.y), tr(t.Right(t.pos.y), t.pos.y);
         ImVec2 br(t.pos.x + t.w, t.pos.y + t.h), bl(t.pos.x, t.pos.y + t.h);
@@ -604,6 +754,15 @@ namespace chroma {
             y += previewH;
         }
 
+        /* メモリ同期の進み具合 */
+        if (sync::g_Active) {
+            char sbuf[48];
+            snprintf(sbuf, sizeof(sbuf), "SYNCING COLORS  %d%%", (int) (sync::Progress() * 100.0f));
+            float ss = 16 * unit;
+            float sy = t.pos.y + t.h - footerH - ss * 0.5f;
+            Text(dl, ss, ImVec2(t.pos.x + (t.w - TextW(ss, sbuf)) * 0.5f, sy), pal::Lime, sbuf);
+        }
+
         /* 操作ガイド */
         const char* guide = "D-PAD MOVE   L SELECT   L-STICK LEFT BACK";
         float gs = 16 * unit;
@@ -621,7 +780,8 @@ namespace chroma {
     }
 
     void OnNewFrame() {
-        ApplyTeamColors();
+        ImGuiIO& io = ImGui::GetIO();
+        ApplyTeamColors(io.DeltaTime > 0.0f && io.DeltaTime < 0.25f ? io.DeltaTime : (1.0f / 60.0f));
     }
 
     void OnRender() {
