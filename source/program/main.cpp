@@ -114,36 +114,54 @@ namespace chroma {
     }
 
     /* ------------------------------------------------------------------ */
-    /*  メモリ同期(少しずつ、毎フレーム数MBずつ探して置き換える)         */
+    /*  メモリ同期                                                         */
+    /*                                                                    */
+    /*  1. 試合が始まったら、裏方スレッドでゲームのメモリを一度だけ探し、  */
+    /*     チームの色が写されている場所を一覧にしておく(準備)。          */
+    /*  2. 色を変えたときは、その一覧の場所だけを書き換える。              */
+    /*     → メモリ全体を探し直さないので、ほぼ一瞬で変わる。              */
     /* ------------------------------------------------------------------ */
 
     namespace sync {
-        struct Pair {
-            u32 o[4]; u32 n[4];   /* float の RGB(A) */
-            u16 ho[3]; u16 hn[3]; /* 半精度(16bit)の RGB。GPU 向けにこの形で持っている場所もある */
-            bool half;            /* 半精度でも探すか */
-        };
-        constexpr int MaxPairs = teamcolor::TeamCount * SetCount * BlockColors;
-        constexpr size_t ChunkBytes   = 64u << 10;   /* 64KB ずつ(読む前に毎回、領域がまだあるか確認する) */
+        constexpr int Slots = teamcolor::TeamCount * SetCount * BlockColors;
 
-        Pair      g_Pairs[MaxPairs];
-        int       g_PairCount = 0;
+        /* 探す値(控えの色) */
+        struct Pat { u32 f[3]; u16 h[3]; bool half; u16 slot; };
+        /* 見つかった場所 */
+        struct Entry { uintptr_t addr; u16 slot; u8 width; };
+
+        constexpr int    MaxEntries = 32768;
+        constexpr size_t ChunkBytes = 64u << 10;
+
+        Pat       g_Pats[Slots];
+        int       g_PatCount = 0;
+        Entry     g_Entries[MaxEntries];
+        int       g_EntryCount = 0;
+        bool      g_Overflow = false;
         u64       g_Bloom[65536 / 64];
         u64       g_Bloom16[65536 / 64];
-        int       g_Pass = 0;  /* 0: 普通のメモリ, 1: キャッシュされないメモリ(遅いので後回し) */
+
+        bool      g_Indexing = false;  /* 裏方スレッドが探している最中 */
+        bool      g_Ready = false;     /* 一覧が使える */
+        bool      g_Stale = false;     /* 探している間にゲームが色をセットし直した */
         bool      g_Request = false;
         bool      g_WorkerStarted = false;
-        alignas(0x1000) u8 g_Stack[0x10000];
-        alignas(0x10) u8 g_ThreadStorage[0x400];  /* nn::os::ThreadType(SDK の版で大きさが違っても足りるよう多めに) */
-        void StartWorker();
-        bool      g_Active = false;
+        int       g_Pass = 0;          /* 0: 普通のメモリ, 1: キャッシュされないメモリ */
         uintptr_t g_Next = 0, g_Cur = 0, g_End = 0;
         u64       g_Total = 0, g_Done = 0;
-        int       g_Replaced = 0, g_LastReplaced = -1;
+
+        alignas(0x1000) u8 g_Stack[0x10000];
+        alignas(0x10) u8 g_ThreadStorage[0x400];  /* nn::os::ThreadType(SDK の版で大きさが違っても足りるよう多めに) */
 
         u32 Bits(float f) { u32 u; std::memcpy(&u, &f, 4); return u; }
         u16 HalfBits(float f) { __fp16 h = (__fp16) f; u16 u; std::memcpy(&u, &h, 2); return u; }
         u32 Hash(u32 w) { return (w ^ (w >> 16)) & 0xFFFF; }
+
+        void SlotToIndex(int slot, int& team, int& set, int& k) {
+            k = slot % BlockColors;
+            set = (slot / BlockColors) % SetCount;
+            team = slot / (BlockColors * SetCount);
+        }
 
         bool IsTrivial(const teamcolor::Color4f& c) {
             auto t = [](float v) { return v == 0.0f || v == 1.0f; };
@@ -152,14 +170,9 @@ namespace chroma {
 
         bool Scannable(const MemoryInfo& mi) {
             if ((mi.perm & Perm_Rw) != Perm_Rw) return false;
-            /* キャッシュされないメモリ(GPU用など)は読むのが遅いので、2周目にまわす */
             bool uncached = (mi.attr & MemAttr_IsUncached) != 0;
             if (uncached != (g_Pass == 1)) return false;
-            /*
-             * 途中で消えることのないメモリだけを探す。
-             * (Normal / MappedMemory / TransferMem はゲームやシステムが途中で外すことがあり、
-             *  読んでいる最中に消えるとクラッシュする)
-             */
+            /* 途中で消えることのないメモリだけ */
             switch (mi.type & MemState_Type) {
                 case MemType_Heap: case MemType_CodeMutable: case MemType_ModuleCodeMutable:
                     break;
@@ -172,13 +185,12 @@ namespace chroma {
             return true;
         }
 
-        /* 次に調べるメモリ領域へ進む。無ければ false */
         bool NextRegion() {
             while (true) {
                 MemoryInfo mi{}; u32 pi;
                 if (R_FAILED(svcQueryMemory(&mi, &pi, g_Next))) return false;
                 uintptr_t end = mi.addr + mi.size;
-                if (mi.size == 0 || end <= g_Next) return false;  /* 末尾 */
+                if (mi.size == 0 || end <= g_Next) return false;
                 g_Next = end;
                 if (Scannable(mi)) { g_Cur = mi.addr; g_End = end; return true; }
             }
@@ -186,7 +198,7 @@ namespace chroma {
 
         u64 CountTotal() {
             u64 total = 0;
-            int savedPass = g_Pass;
+            int saved = g_Pass;
             for (g_Pass = 0; g_Pass < 2; g_Pass++) {
                 uintptr_t next = 0;
                 while (true) {
@@ -198,112 +210,81 @@ namespace chroma {
                     if (Scannable(mi)) total += mi.size;
                 }
             }
-            g_Pass = savedPass;
+            g_Pass = saved;
             return total;
         }
 
-        void Start() {
-            std::memset(g_Bloom, 0, sizeof(g_Bloom));
-            std::memset(g_Bloom16, 0, sizeof(g_Bloom16));
-            for (int i = 0; i < g_PairCount; i++) {
-                u32 h = Hash(g_Pairs[i].o[0]);
-                g_Bloom[h >> 6] |= 1ull << (h & 63);
-                if (g_Pairs[i].half) {
-                    u32 h16 = g_Pairs[i].ho[0];
-                    g_Bloom16[h16 >> 6] |= 1ull << (h16 & 63);
-                }
-            }
-            g_Pass = 0;
-            g_Next = 0; g_Cur = g_End = 0;
-            g_Total = 0; g_Done = 0; g_Replaced = 0;
-            if (g_PairCount == 0) return;
-            __atomic_store_n(&g_Active, true, __ATOMIC_RELEASE);
-            StartWorker();
-            __atomic_store_n(&g_Request, true, __ATOMIC_RELEASE);
+        void Record(uintptr_t addr, u16 slot, u8 width) {
+            if (g_EntryCount >= MaxEntries) { g_Overflow = true; return; }
+            g_Entries[g_EntryCount++] = { addr, slot, width };
         }
 
-        /* RGB の3つが一致したら RGB だけ書き換える(アルファはそのまま) */
-        void ScanRange(uintptr_t start, size_t bytes) {
-            volatile u32* p = reinterpret_cast<volatile u32*>(start);
+        void IndexRange(uintptr_t start, size_t bytes) {
+            const volatile u32* p = reinterpret_cast<const volatile u32*>(start);
             size_t n = bytes / 4;
             for (size_t i = 0; i + 2 < n; i++) {
                 u32 w = p[i];
                 u32 h = Hash(w);
                 if (!(g_Bloom[h >> 6] & (1ull << (h & 63)))) continue;
-                for (int k = 0; k < g_PairCount; k++) {
-                    const Pair& pr = g_Pairs[k];
-                    if (w != pr.o[0] || p[i + 1] != pr.o[1] || p[i + 2] != pr.o[2]) continue;
-                    p[i] = pr.n[0]; p[i + 1] = pr.n[1]; p[i + 2] = pr.n[2];
-                    g_Replaced++;
+                for (int k = 0; k < g_PatCount; k++) {
+                    const Pat& pt = g_Pats[k];
+                    if (w != pt.f[0] || p[i + 1] != pt.f[1] || p[i + 2] != pt.f[2]) continue;
+                    Record(start + i * 4, pt.slot, 4);
                     i += 2;
                     break;
                 }
             }
-
-            /* 半精度(16bit)の RGB */
-            volatile u16* q = reinterpret_cast<volatile u16*>(start);
+            const volatile u16* q = reinterpret_cast<const volatile u16*>(start);
             size_t m = bytes / 2;
             for (size_t i = 0; i + 2 < m; i++) {
                 u16 w = q[i];
                 if (!(g_Bloom16[w >> 6] & (1ull << (w & 63)))) continue;
-                for (int k = 0; k < g_PairCount; k++) {
-                    const Pair& pr = g_Pairs[k];
-                    if (!pr.half || w != pr.ho[0] || q[i + 1] != pr.ho[1] || q[i + 2] != pr.ho[2]) continue;
-                    q[i] = pr.hn[0]; q[i + 1] = pr.hn[1]; q[i + 2] = pr.hn[2];
-                    g_Replaced++;
+                for (int k = 0; k < g_PatCount; k++) {
+                    const Pat& pt = g_Pats[k];
+                    if (!pt.half || w != pt.h[0] || q[i + 1] != pt.h[1] || q[i + 2] != pt.h[2]) continue;
+                    Record(start + i * 2, pt.slot, 2);
                     i += 2;
                     break;
                 }
             }
         }
 
-        /*
-         * 探す作業は別スレッドで行う。
-         * 優先度を一番低くしてあるので、ゲームの処理が空いている時間だけ動き、
-         * 画面の処理(1フレームの時間)には影響しない。
-         */
-        void RunAll() {
+        void RunIndex() {
+            g_EntryCount = 0; g_Overflow = false;
+            g_Pass = 0; g_Next = 0; g_Cur = g_End = 0; g_Done = 0;
             g_Total = CountTotal();
             size_t sinceYield = 0;
             while (true) {
                 if (g_Cur >= g_End && !NextRegion()) {
-                    if (g_Pass == 0) {  /* 普通のメモリが終わったら、キャッシュされないメモリへ */
-                        g_Pass = 1;
-                        g_Next = 0; g_Cur = g_End = 0;
-                        continue;
-                    }
+                    if (g_Pass == 0) { g_Pass = 1; g_Next = 0; g_Cur = g_End = 0; continue; }
                     break;
                 }
-                /* 直前に領域が消えていないか確認してから読む */
                 MemoryInfo mi{}; u32 pi;
                 if (R_FAILED(svcQueryMemory(&mi, &pi, g_Cur)) || !Scannable(mi)) { g_Cur = g_End; continue; }
                 uintptr_t limit = mi.addr + mi.size < g_End ? mi.addr + mi.size : g_End;
                 size_t len = limit - g_Cur;
                 if (len > ChunkBytes) len = ChunkBytes;
-                ScanRange(g_Cur, len);
+                IndexRange(g_Cur, len);
                 g_Cur += len; g_Done += len;
-
                 sinceYield += len;
                 if (sinceYield >= (1u << 20)) { sinceYield = 0; nn::os::YieldThread(); }
             }
-            g_LastReplaced = g_Replaced;
-            __atomic_store_n(&g_Active, false, __ATOMIC_RELEASE);
+            bool stale = __atomic_exchange_n(&g_Stale, false, __ATOMIC_ACQ_REL);
+            __atomic_store_n(&g_Ready, !stale, __ATOMIC_RELEASE);
+            __atomic_store_n(&g_Indexing, false, __ATOMIC_RELEASE);
         }
 
         void Worker(void*) {
             while (true) {
-                if (__atomic_exchange_n(&g_Request, false, __ATOMIC_ACQ_REL)) {
-                    RunAll();
-                } else {
-                    nn::os::SleepThread(nn::TimeSpan::FromMilliSeconds(20));
-                }
+                if (__atomic_exchange_n(&g_Request, false, __ATOMIC_ACQ_REL)) RunIndex();
+                else nn::os::SleepThread(nn::TimeSpan::FromMilliSeconds(20));
             }
         }
 
         void StartWorker() {
             if (g_WorkerStarted) return;
             auto* thread = reinterpret_cast<nn::os::ThreadType*>(g_ThreadStorage);
-            /* 優先度 31 = 一番低い。コア 0〜2 のどこで動いてもよい */
+            /* 優先度 31 = 一番低い。ゲームが空いている時間だけ動く。コア 0〜2 のどこでも */
             if (R_FAILED(nn::os::CreateThread(thread, &Worker, nullptr, g_Stack, sizeof(g_Stack), 31))) return;
             nn::os::SetThreadCoreMask(thread, 2, 0x7);
             nn::os::SetThreadNamePointer(thread, "ChromaSync");
@@ -311,39 +292,72 @@ namespace chroma {
             g_WorkerStarted = true;
         }
 
-        float Progress() { return g_Total ? Clamp01((float) g_Done / (float) g_Total) : (g_Active ? 0.0f : 1.0f); }
+        float Progress() { return g_Total ? Clamp01((float) g_Done / (float) g_Total) : 0.0f; }
+        bool  Indexing() { return __atomic_load_n(&g_Indexing, __ATOMIC_ACQUIRE); }
+        bool  Ready()    { return __atomic_load_n(&g_Ready, __ATOMIC_ACQUIRE); }
     }
 
-    /* 控え(古い色) → 表の今の色 の対応を作って、メモリ同期を始める */
-    void StartSync() {
-        sync::g_PairCount = 0;
-        for (int team = 0; team < teamcolor::TeamCount; team++) {
-            for (int set = 0; set < SetCount; set++) {
-                Committed& c = g_Committed[team][set];
-                teamcolor::Color4f* block = GetBlock(team, set);
-                if (!c.valid || block == nullptr) continue;
-                for (int k = 0; k < BlockColors; k++) {
-                    const teamcolor::Color4f& o = c.colors[k];
-                    const teamcolor::Color4f& n = block[k];
-                    if (o.r == n.r && o.g == n.g && o.b == n.b) continue;
-                    if (sync::IsTrivial(o)) continue;  /* (1,0,0) などは他のデータと紛らわしいので触らない */
-                    sync::Pair& pr = sync::g_Pairs[sync::g_PairCount++];
-                    pr.o[0] = sync::Bits(o.r); pr.o[1] = sync::Bits(o.g); pr.o[2] = sync::Bits(o.b); pr.o[3] = sync::Bits(o.a);
-                    pr.n[0] = sync::Bits(n.r); pr.n[1] = sync::Bits(n.g); pr.n[2] = sync::Bits(n.b); pr.n[3] = sync::Bits(n.a);
-                    pr.ho[0] = sync::HalfBits(o.r); pr.ho[1] = sync::HalfBits(o.g); pr.ho[2] = sync::HalfBits(o.b);
-                    pr.hn[0] = sync::HalfBits(n.r); pr.hn[1] = sync::HalfBits(n.g); pr.hn[2] = sync::HalfBits(n.b);
-                    /* 16bit にすると同じ値になる/0 と 1 だけになる色は紛らわしいので半精度では探さない */
-                    {
-                        auto triv = [](u16 v) { return v == 0x0000 || v == 0x3C00; };
-                        bool same = pr.ho[0] == pr.hn[0] && pr.ho[1] == pr.hn[1] && pr.ho[2] == pr.hn[2];
-                        pr.half = !same && !(triv(pr.ho[0]) && triv(pr.ho[1]) && triv(pr.ho[2]));
-                    }
-                }
-                SnapshotBlock(team, set);
+    /* 控えの色(いまゲームの中に写されている色)を探す準備をして、裏方に頼む */
+    void StartIndex() {
+        if (sync::Indexing()) return;
+        sync::g_PatCount = 0;
+        std::memset(sync::g_Bloom, 0, sizeof(sync::g_Bloom));
+        std::memset(sync::g_Bloom16, 0, sizeof(sync::g_Bloom16));
+        for (int slot = 0; slot < sync::Slots; slot++) {
+            int team, set, k;
+            sync::SlotToIndex(slot, team, set, k);
+            const Committed& c = g_Committed[team][set];
+            if (!c.valid) continue;
+            const teamcolor::Color4f& o = c.colors[k];
+            if (sync::IsTrivial(o)) continue;  /* (1,0,0) などは他のデータと紛らわしいので探さない */
+            sync::Pat& pt = sync::g_Pats[sync::g_PatCount++];
+            pt.f[0] = sync::Bits(o.r); pt.f[1] = sync::Bits(o.g); pt.f[2] = sync::Bits(o.b);
+            pt.h[0] = sync::HalfBits(o.r); pt.h[1] = sync::HalfBits(o.g); pt.h[2] = sync::HalfBits(o.b);
+            auto triv = [](u16 v) { return v == 0x0000 || v == 0x3C00; };
+            pt.half = !(triv(pt.h[0]) && triv(pt.h[1]) && triv(pt.h[2]));
+            pt.slot = (u16) slot;
+            u32 h = sync::Hash(pt.f[0]);
+            sync::g_Bloom[h >> 6] |= 1ull << (h & 63);
+            if (pt.half) sync::g_Bloom16[pt.h[0] >> 6] |= 1ull << (pt.h[0] & 63);
+        }
+        if (sync::g_PatCount == 0) return;
+        __atomic_store_n(&sync::g_Ready, false, __ATOMIC_RELEASE);
+        __atomic_store_n(&sync::g_Indexing, true, __ATOMIC_RELEASE);
+        sync::StartWorker();
+        __atomic_store_n(&sync::g_Request, true, __ATOMIC_RELEASE);
+    }
+
+    /* 一覧の場所だけを、控えの色 → 表の今の色 に書き換える(一瞬で終わる) */
+    void ApplyEntries() {
+        for (int i = 0; i < sync::g_EntryCount; i++) {
+            const sync::Entry& e = sync::g_Entries[i];
+            int team, set, k;
+            sync::SlotToIndex(e.slot, team, set, k);
+            teamcolor::Color4f* block = GetBlock(team, set);
+            if (block == nullptr) continue;
+            const teamcolor::Color4f& o = g_Committed[team][set].colors[k];
+            const teamcolor::Color4f& n = block[k];
+            if (e.width == 4) {
+                volatile u32* p = reinterpret_cast<volatile u32*>(e.addr);
+                /* まだ控えの色のままのときだけ書き換える(別のデータに変わっていたら触らない) */
+                if (p[0] != sync::Bits(o.r) || p[1] != sync::Bits(o.g) || p[2] != sync::Bits(o.b)) continue;
+                p[0] = sync::Bits(n.r); p[1] = sync::Bits(n.g); p[2] = sync::Bits(n.b);
+            } else {
+                volatile u16* q = reinterpret_cast<volatile u16*>(e.addr);
+                if (q[0] != sync::HalfBits(o.r) || q[1] != sync::HalfBits(o.g) || q[2] != sync::HalfBits(o.b)) continue;
+                q[0] = sync::HalfBits(n.r); q[1] = sync::HalfBits(n.g); q[2] = sync::HalfBits(n.b);
             }
         }
-        sync::Start();
+        /* 控えを今の色に更新 */
+        for (int team = 0; team < teamcolor::TeamCount; team++) {
+            for (int set = 0; set < SetCount; set++) {
+                if (g_Committed[team][set].valid) SnapshotBlock(team, set);
+            }
+        }
     }
+
+    bool  g_EverUsed = false;     /* 一度でも OVERRIDE を使ったか(使っていなければ準備もしない) */
+    float g_IndexDelay = -1.0f;   /* 試合の準備から、探し始めるまでの待ち時間 */
 
     /* フックから呼ばれる: ゲームが色をセットするとき、上書き中なら自分の色にすり替える */
     void OnSetBlock(teamcolor::Color4f* block, const teamcolor::Color4f* color, u64 a, u64 b, float f) {
@@ -363,15 +377,18 @@ namespace chroma {
                 } else {
                     g_OrigSetBlock(block, color, a, b, f);
                 }
-                /* 試合の準備でセットされた色 = これからゲームが写す色 */
+                /* 試合の準備でセットされた色 = これからゲームが写す色。一覧は作り直し */
                 SnapshotBlock(team, set);
+                __atomic_store_n(&sync::g_Ready, false, __ATOMIC_RELEASE);
+                if (sync::Indexing()) __atomic_store_n(&sync::g_Stale, true, __ATOMIC_RELEASE);
+                g_IndexDelay = 4.0f;  /* キャラや地面が色を写し終わるのを待ってから探す */
                 return;
             }
         }
         g_OrigSetBlock(block, color, a, b, f);
     }
 
-    /* メニューで変えた色を、ゲームと同じ計算ですぐに作り直す */
+    /* メニューで変えた色を、ゲームと同じ計算ですぐに作り直す(表だけ) */
     void ReapplyTeam(int team) {
         if (g_OrigSetBlock == nullptr) return;
         const TeamOverride& o = g_Teams[team];
@@ -389,35 +406,41 @@ namespace chroma {
         }
     }
 
-    /* 毎フレーム呼ぶ。表はすぐ作り直し、手が止まったらメモリ同期 */
+    /* 毎フレーム呼ぶ */
     void ApplyTeamColors(float dt) {
         static bool  lastEnabled[teamcolor::TeamCount] = {};
         static float lastColor[teamcolor::TeamCount][3] = {};
-        static float idle = 0.0f;
         static bool  pending = false;
 
-        bool anyChange = false;
         for (int team = 0; team < teamcolor::TeamCount; team++) {
             const TeamOverride& o = g_Teams[team];
+            if (o.enabled) g_EverUsed = true;
             bool changed = o.enabled != lastEnabled[team];
             if (o.enabled) {
                 for (int c = 0; c < 3; c++) changed |= o.color[c] != lastColor[team][c];
             }
             if (!changed) continue;
 
-            ReapplyTeam(team);
+            ReapplyTeam(team);  /* 発射するインクなどはこれだけで変わる */
             lastEnabled[team] = o.enabled;
             for (int c = 0; c < 3; c++) lastColor[team][c] = o.color[c];
-            anyChange = true;
+            pending = true;
         }
 
-        if (anyChange) { pending = true; idle = 0.0f; }
-        else idle += dt;
+        /* 試合が始まって少し待ったら、裏方で一覧を作っておく */
+        if (g_IndexDelay >= 0.0f) {
+            g_IndexDelay -= dt;
+            if (g_IndexDelay < 0.0f && g_EverUsed && !sync::Indexing()) StartIndex();
+            else if (g_IndexDelay < 0.0f) g_IndexDelay = 0.0f;  /* 前の準備が終わるのを待つ */
+            if (!g_EverUsed) g_IndexDelay = -1.0f;
+        }
 
-        /* 0.3秒操作が止まって、前の同期が終わっていたら同期する */
-        if (pending && idle > 0.3f && !__atomic_load_n(&sync::g_Active, __ATOMIC_ACQUIRE)) {
+        if (!pending) return;
+        if (sync::Ready()) {
+            ApplyEntries();  /* 一覧があれば一瞬で書き換え */
             pending = false;
-            StartSync();
+        } else if (!sync::Indexing() && g_IndexDelay < 0.0f) {
+            StartIndex();    /* 一覧がまだ無ければ作る(できたら上で書き換える) */
         }
     }
 
@@ -798,7 +821,7 @@ namespace chroma {
 
         float headerH = 54 * unit;
         float previewH = colorPage ? 70 * unit : 0.0f;
-        float footerH = (sync::g_Active ? 54 : 34) * unit;
+        float footerH = (sync::Indexing() ? 54 : 34) * unit;
         float h = headerH + L.rowH * count + previewH + footerH;
         float top = 30 * unit;
 
@@ -858,9 +881,9 @@ namespace chroma {
         /* 下: 同期の進み具合 + 操作ガイド */
         float gs = 13 * unit;
         float gy = top + h - 22 * unit;
-        if (sync::g_Active) {
+        if (sync::Indexing()) {
             char sbuf[40];
-            snprintf(sbuf, sizeof(sbuf), "SYNCING COLORS  %d%%", (int) (sync::Progress() * 100.0f));
+            snprintf(sbuf, sizeof(sbuf), "PREPARING COLORS  %d%%", (int) (sync::Progress() * 100.0f));
             Text(dl, gs, ImVec2(L.x + L.pad, gy - 20 * unit), bw::White, sbuf);
         }
         const char* guide = colorPage ? "L SELECT   D-PAD ADJUST   L-STICK LEFT BACK" : "L SELECT   L-STICK LEFT CLOSE";
