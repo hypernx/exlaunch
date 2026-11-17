@@ -1,4 +1,5 @@
 #include "lib.hpp"
+#include "nn/os.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -124,13 +125,17 @@ namespace chroma {
         };
         constexpr int MaxPairs = teamcolor::TeamCount * SetCount * BlockColors;
         constexpr size_t ChunkBytes   = 256u << 10;  /* 256KB ずつ */
-        constexpr u64    TicksPerFrame = 19200000ull / 1000ull;  /* 1フレームあたり最大 1ms (19.2MHz) */
 
         Pair      g_Pairs[MaxPairs];
         int       g_PairCount = 0;
         u64       g_Bloom[65536 / 64];
         u64       g_Bloom16[65536 / 64];
         int       g_Pass = 0;  /* 0: 普通のメモリ, 1: キャッシュされないメモリ(遅いので後回し) */
+        bool      g_Request = false;
+        bool      g_WorkerStarted = false;
+        alignas(0x1000) u8 g_Stack[0x10000];
+        alignas(0x10) u8 g_ThreadStorage[0x400];  /* nn::os::ThreadType(SDK の版で大きさが違っても足りるよう多めに) */
+        void StartWorker();
         bool      g_Active = false;
         uintptr_t g_Next = 0, g_Cur = 0, g_End = 0;
         u64       g_Total = 0, g_Done = 0;
@@ -207,8 +212,11 @@ namespace chroma {
             }
             g_Pass = 0;
             g_Next = 0; g_Cur = g_End = 0;
-            g_Total = CountTotal(); g_Done = 0; g_Replaced = 0;
-            g_Active = g_PairCount > 0;
+            g_Total = 0; g_Done = 0; g_Replaced = 0;
+            if (g_PairCount == 0) return;
+            __atomic_store_n(&g_Active, true, __ATOMIC_RELEASE);
+            StartWorker();
+            __atomic_store_n(&g_Request, true, __ATOMIC_RELEASE);
         }
 
         /* RGB の3つが一致したら RGB だけ書き換える(アルファはそのまま) */
@@ -246,19 +254,22 @@ namespace chroma {
             }
         }
 
-        void Step() {
-            if (!g_Active) return;
-            u64 start = svcGetSystemTick();
-            while (svcGetSystemTick() - start < TicksPerFrame) {
+        /*
+         * 探す作業は別スレッドで行う。
+         * 優先度を一番低くしてあるので、ゲームの処理が空いている時間だけ動き、
+         * 画面の処理(1フレームの時間)には影響しない。
+         */
+        void RunAll() {
+            g_Total = CountTotal();
+            size_t sinceYield = 0;
+            while (true) {
                 if (g_Cur >= g_End && !NextRegion()) {
                     if (g_Pass == 0) {  /* 普通のメモリが終わったら、キャッシュされないメモリへ */
                         g_Pass = 1;
                         g_Next = 0; g_Cur = g_End = 0;
                         continue;
                     }
-                    g_Active = false;
-                    g_LastReplaced = g_Replaced;
-                    return;
+                    break;
                 }
                 /* 直前に領域が消えていないか確認してから読む */
                 MemoryInfo mi{}; u32 pi;
@@ -268,10 +279,36 @@ namespace chroma {
                 if (len > ChunkBytes) len = ChunkBytes;
                 ScanRange(g_Cur, len);
                 g_Cur += len; g_Done += len;
+
+                sinceYield += len;
+                if (sinceYield >= (1u << 20)) { sinceYield = 0; nn::os::YieldThread(); }
+            }
+            g_LastReplaced = g_Replaced;
+            __atomic_store_n(&g_Active, false, __ATOMIC_RELEASE);
+        }
+
+        void Worker(void*) {
+            while (true) {
+                if (__atomic_exchange_n(&g_Request, false, __ATOMIC_ACQ_REL)) {
+                    RunAll();
+                } else {
+                    nn::os::SleepThread(nn::TimeSpan::FromMilliSeconds(20));
+                }
             }
         }
 
-        float Progress() { return g_Total ? Clamp01((float) g_Done / (float) g_Total) : 1.0f; }
+        void StartWorker() {
+            if (g_WorkerStarted) return;
+            auto* thread = reinterpret_cast<nn::os::ThreadType*>(g_ThreadStorage);
+            /* 優先度 31 = 一番低い。コア 0〜2 のどこで動いてもよい */
+            if (R_FAILED(nn::os::CreateThread(thread, &Worker, nullptr, g_Stack, sizeof(g_Stack), 31))) return;
+            nn::os::SetThreadCoreMask(thread, 2, 0x7);
+            nn::os::SetThreadNamePointer(thread, "ChromaSync");
+            nn::os::StartThread(thread);
+            g_WorkerStarted = true;
+        }
+
+        float Progress() { return g_Total ? Clamp01((float) g_Done / (float) g_Total) : (g_Active ? 0.0f : 1.0f); }
     }
 
     /* 控え(古い色) → 表の今の色 の対応を作って、メモリ同期を始める */
@@ -375,11 +412,10 @@ namespace chroma {
         else idle += dt;
 
         /* 0.3秒操作が止まって、前の同期が終わっていたら同期する */
-        if (pending && idle > 0.3f && !sync::g_Active) {
+        if (pending && idle > 0.3f && !__atomic_load_n(&sync::g_Active, __ATOMIC_ACQUIRE)) {
             pending = false;
             StartSync();
         }
-        sync::Step();
     }
 
     /* ------------------------------------------------------------------ */
