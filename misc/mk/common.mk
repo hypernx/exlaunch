@@ -47,12 +47,16 @@ CFLAGS	+=	$(INCLUDE) -D__SWITCH__ -D__RTLD_6XX__
 
 CFLAGS	+= $(EXL_CFLAGS) -I"$(DEVKITPRO)/libnx/include" -I$(ROOT_SOURCE) $(addprefix -I,$(MODULES))
 
+CFLAGS	+= -isystem $(TOPDIR)/libs/imgui-xeno/include -isystem $(TOPDIR)/libs/imgui-xeno/extern/imgui
+
 CXXFLAGS	:= $(CFLAGS) $(EXL_CXXFLAGS) -fno-rtti -fno-exceptions -fno-asynchronous-unwind-tables -fno-unwind-tables -std=gnu++23
 
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	:=  -specs=$(SPECS_PATH)/$(SPECS_NAME) -g $(ARCH) -Wl,-Map,$(notdir $*.map) -nostartfiles
 
-LIBS	:=
+# imgui-xeno (NVN 用 ImGui バックエンド)。CI で libs/imgui-xeno/build にビルドしておく。
+IMGUI_XENO_DIR	:=	$(TOPDIR)/libs/imgui-xeno
+LIBS	:=	-L$(IMGUI_XENO_DIR)/build -limgui_xeno
 
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing

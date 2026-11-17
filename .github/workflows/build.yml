@@ -15,6 +15,14 @@ jobs:
           apt-get update
           apt-get install -y python3 python3-pip cmake make git
           dkp-pacman -S --noconfirm switch-tools || true
+      - name: Build imgui-xeno
+        run: |
+          git config --global --add safe.directory '*'
+          cmake -S libs/imgui-xeno -B libs/imgui-xeno/build \
+            -DCMAKE_TOOLCHAIN_FILE=$PWD/libs/imgui-xeno/cmake/toolchain.cmake \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build libs/imgui-xeno/build -j"$(nproc)"
+          ls -l libs/imgui-xeno/build/libimgui_xeno.a
       - name: Build plugin
         run: make -j"$(nproc)"
       # モジュール先頭(+0:分岐, +4:MOD0, +8:SDKバージョン)の確認用
