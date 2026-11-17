@@ -132,6 +132,12 @@ namespace chroma {
 
         constexpr int    MaxEntries = 32768;
         constexpr size_t ChunkBytes = 64u << 10;
+        constexpr size_t VolatileChunkBytes = 16u << 10;  /* 消えるかもしれないメモリは 16KB ずつ */
+
+        bool IsVolatileType(u32 type) {
+            u32 t = type & MemState_Type;
+            return t == MemType_Normal || t == MemType_MappedMemory;
+        }
 
         Pat       g_Pats[Slots];
         int       g_PatCount = 0;
@@ -172,9 +178,14 @@ namespace chroma {
             if ((mi.perm & Perm_Rw) != Perm_Rw) return false;
             bool uncached = (mi.attr & MemAttr_IsUncached) != 0;
             if (uncached != (g_Pass == 1)) return false;
-            /* 途中で消えることのないメモリだけ */
+            /*
+             * Heap / CodeMutable: 途中で消えないメモリ。
+             * Normal / MappedMemory: ゲームが確保したり外したりするメモリ(地面のインクの色はここにあるらしい)。
+             *   読む直前に毎回まだあるか確かめ、小さく区切って読む。
+             */
             switch (mi.type & MemState_Type) {
                 case MemType_Heap: case MemType_CodeMutable: case MemType_ModuleCodeMutable:
+                case MemType_Normal: case MemType_MappedMemory:
                     break;
                 default:
                     return false;
@@ -263,7 +274,8 @@ namespace chroma {
                 if (R_FAILED(svcQueryMemory(&mi, &pi, g_Cur)) || !Scannable(mi)) { g_Cur = g_End; continue; }
                 uintptr_t limit = mi.addr + mi.size < g_End ? mi.addr + mi.size : g_End;
                 size_t len = limit - g_Cur;
-                if (len > ChunkBytes) len = ChunkBytes;
+                size_t maxLen = IsVolatileType(mi.type) ? VolatileChunkBytes : ChunkBytes;
+                if (len > maxLen) len = maxLen;
                 IndexRange(g_Cur, len);
                 g_Cur += len; g_Done += len;
                 sinceYield += len;
@@ -329,8 +341,22 @@ namespace chroma {
 
     /* 一覧の場所だけを、控えの色 → 表の今の色 に書き換える(一瞬で終わる) */
     void ApplyEntries() {
+        uintptr_t okStart = 0, okEnd = 0;  /* 直前に確かめた「書いて大丈夫な」範囲 */
         for (int i = 0; i < sync::g_EntryCount; i++) {
             const sync::Entry& e = sync::g_Entries[i];
+
+            /* その場所のメモリがまだあって書き込めるか確かめる(一覧はアドレス順なので、範囲ごとに1回) */
+            if (e.addr < okStart || e.addr + 12 > okEnd) {
+                MemoryInfo mi{}; u32 pi;
+                if (R_FAILED(svcQueryMemory(&mi, &pi, e.addr)) || (mi.perm & Perm_Rw) != Perm_Rw ||
+                    (mi.type & MemState_Type) == MemType_Unmapped) {
+                    okStart = okEnd = 0;
+                    continue;
+                }
+                okStart = mi.addr; okEnd = mi.addr + mi.size;
+                if (e.addr + 12 > okEnd) continue;
+            }
+
             int team, set, k;
             sync::SlotToIndex(e.slot, team, set, k);
             teamcolor::Color4f* block = GetBlock(team, set);
