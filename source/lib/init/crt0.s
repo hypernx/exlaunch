@@ -18,6 +18,10 @@
 __module_start:
     b entrypoint
     .word __nx_mod0 - __module_start
+    // NintendoSDK 20 以降の rtld は、モジュール先頭 +8 の値を
+    // 「SDKバージョン構造体へのオフセット」として読む。
+    // ここが無いと NOP(0xd503201f) をオフセットとして読んでクラッシュする。
+    .word __exl_sdk_version - __module_start
 
     .align 4
     .ascii "~~exlaunch uwu~~"
@@ -93,3 +97,11 @@ __nx_mod0:
     .word  __eh_frame_hdr_start__   - __nx_mod0
     .word  __eh_frame_hdr_end__     - __nx_mod0
     .word  exl_nx_module_runtime    - __nx_mod0
+// SDK version referenced from the module header (+8).
+// Matches Splatoon 3's main (NintendoSDK 20.5.22).
+.section ".rodata.exl_sdk_version","a"
+.align 2
+__exl_sdk_version:
+    .word 20
+    .word 5
+    .word 22

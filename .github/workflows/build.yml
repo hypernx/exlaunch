@@ -17,6 +17,10 @@ jobs:
           dkp-pacman -S --noconfirm switch-tools || true
       - name: Build plugin
         run: make -j"$(nproc)"
+      # モジュール先頭(+0:分岐, +4:MOD0, +8:SDKバージョン)の確認用
+      - name: Show module header
+        run: |
+          $DEVKITPRO/devkitA64/bin/aarch64-none-elf-objdump -s --start-address=0 --stop-address=0x20 *.elf || true
       # SDカードのルートにそのまま貼り付けられる形にまとめる
       - name: Package for SD card
         run: |
