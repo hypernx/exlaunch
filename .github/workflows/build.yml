@@ -33,11 +33,12 @@ jobs:
       - name: Show module header
         run: |
           $DEVKITPRO/devkitA64/bin/aarch64-none-elf-objdump -s --start-address=0 --stop-address=0x20 *.elf || true
-      # SDカードのルートにそのまま貼り付けられる形にまとめる
+      # SimpleModManager 用: SDカードのルートに貼り付ける形
+      #   mods/<ゲーム名>/<MOD名>/contents/<プログラムID>/exefs/
       - name: Package for SD card
         run: |
           PROGRAM_ID=$(grep -E '^PROGRAM_ID' config.mk | sed -E 's/.*:= *//' | tr -d '[:space:]')
-          DEST=sd/atmosphere/contents/${PROGRAM_ID}/exefs
+          DEST="sd/mods/Splatoon 3/Chroma Rush/contents/${PROGRAM_ID}/exefs"
           mkdir -p "$DEST"
           cp deploy/subsdk9 deploy/main.npdm "$DEST/"
           find sd -type f
@@ -57,7 +58,7 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p out
-          (cd sd && python3 -m zipfile -c ../out/splatoon3-plugin.zip atmosphere)
+          (cd sd && python3 -m zipfile -c ../out/splatoon3-plugin.zip mods)
           cp *.elf out/ 2>/dev/null || true
           echo "${GITHUB_SHA}" > out/COMMIT
           cd out
