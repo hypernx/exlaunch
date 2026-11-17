@@ -435,30 +435,34 @@ namespace chroma {
             float pop = EaseOutBack(t / 0.4f);
             ImVec2 c(ds.x * 0.5f, ds.y * 0.5f);
             ImVec2 p0(c.x - cw * 0.5f * pop, c.y - ch * 0.5f * pop), p1(c.x + cw * 0.5f * pop, c.y + ch * 0.5f * pop);
-            dl->AddRectFilled(p0, p1, pal::WithAlpha(IM_COL32(30, 14, 58, 255), 0.92f * fade), 14 * unit);
-            dl->AddRect(p0, p1, pal::WithAlpha(pal::Pink, fade), 14 * unit, 0, 3 * unit);
+            dl->AddRectFilled(p0, p1, pal::WithAlpha(IM_COL32(8, 8, 8, 255), 0.92f * fade));
+            dl->AddRect(p0, p1, pal::WithAlpha(pal::White, fade), 0, 0, 2 * unit);
             if (pop < 0.9f) return true;
 
             /* ロゴ */
-            DrawBouncyTitle(dl, "CHROMA RUSH", ImVec2(c.x, c.y - 22 * unit), 32 * unit, t, fade);
+            {
+                const char* logo = "CHROMA RUSH";
+                float ts = 30 * unit;
+                float tw = ImGui::GetFont()->CalcTextSizeA(ts, FLT_MAX, 0.0f, logo).x;
+                dl->AddText(ImGui::GetFont(), ts, ImVec2(c.x - tw * 0.5f, c.y - 22 * unit - ts * 0.5f), pal::WithAlpha(pal::White, fade), logo);
+            }
 
             /* ローディングバー */
-            float bw = 240 * unit, bh = 12 * unit;
+            float bw = 240 * unit, bh = 10 * unit;
             ImVec2 b0(c.x - bw * 0.5f, c.y + 12 * unit), b1(c.x + bw * 0.5f, b0.y + bh);
             float prog = Clamp01(t / (Duration - 0.2f));
             prog = 1.0f - (1.0f - prog) * (1.0f - prog);
-            dl->AddRectFilled(b0, b1, pal::WithAlpha(pal::Ink, 0.9f * fade), bh * 0.5f);
-            if (prog > 0.03f) {
-                dl->AddRectFilledMultiColor(ImVec2(b0.x + 2 * unit, b0.y + 2 * unit), ImVec2(b0.x + (bw - 2 * unit) * prog, b1.y - 2 * unit),
-                                            pal::WithAlpha(pal::Pink, fade), pal::WithAlpha(pal::Lime, fade),
-                                            pal::WithAlpha(pal::Lime, fade), pal::WithAlpha(pal::Pink, fade));
+            dl->AddRect(b0, b1, pal::WithAlpha(pal::White, fade), 0, 0, 1.5f * unit);
+            if (prog > 0.01f) {
+                dl->AddRectFilled(ImVec2(b0.x + 3 * unit, b0.y + 3 * unit), ImVec2(b0.x + 3 * unit + (bw - 6 * unit) * prog, b1.y - 3 * unit),
+                                  pal::WithAlpha(pal::White, fade));
             }
 
             char label[24];
             snprintf(label, sizeof(label), "LOADING %d%%", (int) (prog * 100.0f));
             float ls = 14 * unit;
             float lw = ImGui::GetFont()->CalcTextSizeA(ls, FLT_MAX, 0.0f, label).x;
-            dl->AddText(ImGui::GetFont(), ls, ImVec2(c.x - lw * 0.5f, b1.y + 8 * unit), pal::WithAlpha(pal::Cyan, fade), label);
+            dl->AddText(ImGui::GetFont(), ls, ImVec2(c.x - lw * 0.5f, b1.y + 8 * unit), pal::WithAlpha(IM_COL32(170, 170, 170, 255), fade), label);
 
             return true;
         }
@@ -470,7 +474,7 @@ namespace chroma {
 
 }
 
-/* imgui-xeno の入力ヘルパーが持つフラグ(L3+R3 で切り替わる)。 */
+/* imgui-xeno の入力ヘルパーが持つフラグ */
 class InputHelper {
 public:
     static bool toggleInput; /* メニュー操作中か */
@@ -480,47 +484,149 @@ public:
 namespace chroma {
 
     bool IsMenuOpen() { return InputHelper::toggleInput; }
+    void OpenMenu()  { InputHelper::toggleInput = true; }
     void CloseMenu() { InputHelper::toggleInput = false; }
 
     bool Pressed(ImGuiKey k, bool repeat = true) { return ImGui::IsKeyPressed(k, repeat); }
-    bool PressedUp()    { return Pressed(ImGuiKey_GamepadDpadUp)    || Pressed(ImGuiKey_GamepadLStickUp); }
-    bool PressedDown()  { return Pressed(ImGuiKey_GamepadDpadDown)  || Pressed(ImGuiKey_GamepadLStickDown); }
-    /* 値の増減は十字キーの左右だけ(左スティックの左は「戻る」に使う) */
+    bool PressedUp()    { return Pressed(ImGuiKey_GamepadDpadUp)   || Pressed(ImGuiKey_GamepadLStickUp); }
+    bool PressedDown()  { return Pressed(ImGuiKey_GamepadDpadDown) || Pressed(ImGuiKey_GamepadLStickDown); }
     bool HeldLeft()     { return ImGui::IsKeyDown(ImGuiKey_GamepadDpadLeft); }
     bool HeldRight()    { return ImGui::IsKeyDown(ImGuiKey_GamepadDpadRight); }
     bool PressedLeft()  { return Pressed(ImGuiKey_GamepadDpadLeft, false); }
     bool PressedRight() { return Pressed(ImGuiKey_GamepadDpadRight, false); }
     bool PressedDecide(){ return Pressed(ImGuiKey_GamepadL1, false); }          /* L で決定 */
-    bool PressedBack()  { return Pressed(ImGuiKey_GamepadLStickLeft, false); }  /* 左スティックを左に倒すと戻る/閉じる */
+    bool PressedBack()  { return Pressed(ImGuiKey_GamepadLStickLeft, false); }  /* 左スティックを左: 戻る/閉じる */
 
     /* ------------------------------------------------------------------ */
-    /*  台形パネル(上の辺が短い)                                         */
+    /*  色の選び方: 虹色(色相) + 明るさ                                    */
     /* ------------------------------------------------------------------ */
 
-    struct Trap {
-        ImVec2 pos;    /* 左上(下の辺の左端の x) */
-        float  w, h;   /* 下の辺の幅、高さ */
-        float  inset;  /* 上の辺の左右の食い込み(0 で長方形) */
-
-        /* 高さ y での左右の端 */
-        float Left(float y) const  { return pos.x + inset * (1.0f - (y - pos.y) / h); }
-        float Right(float y) const { return pos.x + w - inset * (1.0f - (y - pos.y) / h); }
+    struct Picker {
+        bool  init  = false;
+        float hue   = 0.0f;  /* 0..1 虹色の位置 */
+        float shade = 0.0f;  /* -1 (暗い) .. 0 (あざやか) .. 1 (白っぽい) */
     };
+    Picker g_Pickers[teamcolor::TeamCount];
 
-    void FillTrap(ImDrawList* dl, ImVec2 tl, ImVec2 tr, ImVec2 br, ImVec2 bl, ImU32 col) {
-        ImVec2 pts[4] = { tl, tr, br, bl };
-        dl->AddConvexPolyFilled(pts, 4, col);
+    void PickerToRgb(const Picker& p, float out[3]) {
+        float sat = p.shade > 0.0f ? 1.0f - p.shade : 1.0f;
+        float val = p.shade < 0.0f ? 1.0f + p.shade : 1.0f;
+        ImGui::ColorConvertHSVtoRGB(p.hue, sat, val, out[0], out[1], out[2]);
+        /* ぴったり 0 や 1 は他のデータと紛らわしいので、ほんの少しだけずらす */
+        for (int i = 0; i < 3; i++) out[i] = out[i] * 0.996f + 0.002f;
     }
 
-    void OutlineTrap(ImDrawList* dl, ImVec2 tl, ImVec2 tr, ImVec2 br, ImVec2 bl, ImU32 col, float th) {
-        ImVec2 pts[4] = { tl, tr, br, bl };
-        dl->AddPolyline(pts, 4, col, ImDrawFlags_Closed, th);
+    void PickerFromRgb(Picker& p, const float rgb[3]) {
+        float h, s, v;
+        ImGui::ColorConvertRGBtoHSV(rgb[0], rgb[1], rgb[2], h, s, v);
+        p.hue = h;
+        p.shade = v < 0.99f ? v - 1.0f : 1.0f - s;
+        p.init = true;
     }
 
-    /* 帯(パネルの y0〜y1 の範囲を切り出した台形) */
-    void FillBand(ImDrawList* dl, const Trap& t, float y0, float y1, float pad, ImU32 col) {
-        FillTrap(dl, ImVec2(t.Left(y0) + pad, y0), ImVec2(t.Right(y0) - pad, y0),
-                 ImVec2(t.Right(y1) - pad, y1), ImVec2(t.Left(y1) + pad, y1), col);
+    Picker& GetPicker(int team) {
+        Picker& p = g_Pickers[team];
+        if (!p.init) PickerFromRgb(p, g_Teams[team].color);
+        return p;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*  メニューの状態                                                     */
+    /* ------------------------------------------------------------------ */
+
+    enum class Page { Main, Color };
+
+    namespace menu {
+        Page  g_Page     = Page::Main;
+        int   g_Cursor   = 0;
+        int   g_Team     = 0;
+        float g_OpenTime = 0.0f;
+        bool  g_WasOpen  = false;
+        float g_HoldTime = 0.0f;
+    }
+
+    const char* const MainItems[]  = { "INK COLOR", "REPLAY INTRO" };
+    const char* const ColorItems[] = { "TEAM", "OVERRIDE", "COLOR", "SHADE" };
+    constexpr int MainCount  = 2;
+    constexpr int ColorCount = 4;
+
+    void GoTo(Page p) {
+        menu::g_Page = p;
+        menu::g_Cursor = 0;
+    }
+
+    /* 左右で値を動かす(押し続けると速くなる)。true なら変化した */
+    bool Slide(float& v, float dt, float lo, float hi, bool wrap) {
+        int dir = 0;
+        if (HeldLeft()) dir = -1;
+        if (HeldRight()) dir = 1;
+        if (dir == 0) { menu::g_HoldTime = 0.0f; return false; }
+
+        float step;
+        if (PressedLeft() || PressedRight()) {
+            step = 1.0f / 120.0f;
+        } else {
+            menu::g_HoldTime += dt;
+            if (menu::g_HoldTime < 0.3f) return false;
+            float speed = 0.15f + 0.45f * Clamp01((menu::g_HoldTime - 0.3f) / 1.2f); /* 1秒あたり */
+            step = speed * dt;
+        }
+        v += dir * step * (hi - lo);
+        if (wrap) {
+            while (v < lo) v += hi - lo;
+            while (v >= hi) v -= hi - lo;
+        } else {
+            v = v < lo ? lo : (v > hi ? hi : v);
+        }
+        return true;
+    }
+
+    void HandleInput(float dt) {
+        int count = menu::g_Page == Page::Main ? MainCount : ColorCount;
+        bool canDecide = menu::g_OpenTime > 0.25f;  /* 開いたときの L を決定と間違えない */
+
+        if (PressedUp())   menu::g_Cursor = (menu::g_Cursor + count - 1) % count;
+        if (PressedDown()) menu::g_Cursor = (menu::g_Cursor + 1) % count;
+
+        if (menu::g_Page == Page::Main) {
+            if (canDecide && PressedDecide()) {
+                switch (menu::g_Cursor) {
+                    case 0: GoTo(Page::Color); break;
+                    case 1: intro::Restart(); CloseMenu(); break;
+                }
+            }
+            if (PressedBack()) CloseMenu();
+            return;
+        }
+
+        TeamOverride& o = g_Teams[menu::g_Team];
+        Picker& p = GetPicker(menu::g_Team);
+        switch (menu::g_Cursor) {
+            case 0: /* TEAM */
+                if ((canDecide && PressedDecide()) || PressedLeft() || PressedRight()) menu::g_Team ^= 1;
+                break;
+            case 1: /* OVERRIDE */
+                if ((canDecide && PressedDecide()) || PressedLeft() || PressedRight()) o.enabled = !o.enabled;
+                break;
+            case 2: /* COLOR (虹色) */
+                if (Slide(p.hue, dt, 0.0f, 1.0f, true)) PickerToRgb(p, o.color);
+                break;
+            case 3: /* SHADE */
+                if (Slide(p.shade, dt, -1.0f, 1.0f, false)) PickerToRgb(p, o.color);
+                break;
+        }
+        if (PressedBack()) GoTo(Page::Main);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*  描画(白と黒のシンプルなスタイル)                                 */
+    /* ------------------------------------------------------------------ */
+
+    namespace bw {
+        constexpr ImU32 Black = IM_COL32(0, 0, 0, 255);
+        constexpr ImU32 White = IM_COL32(255, 255, 255, 255);
+        constexpr ImU32 Gray  = IM_COL32(150, 150, 150, 255);
+        constexpr ImU32 Panel = IM_COL32(8, 8, 8, 230);
     }
 
     void Text(ImDrawList* dl, float size, ImVec2 pos, ImU32 col, const char* s) {
@@ -531,245 +637,146 @@ namespace chroma {
         return ImGui::GetFont()->CalcTextSizeA(size, FLT_MAX, 0.0f, s).x;
     }
 
-    /* ------------------------------------------------------------------ */
-    /*  メニューの状態                                                     */
-    /* ------------------------------------------------------------------ */
-
-    enum class Page { Main, Color };
-
-    namespace menu {
-        Page  g_Page      = Page::Main;
-        int   g_Cursor    = 0;
-        int   g_Team      = 0;
-        float g_OpenAnim  = 0.0f;  /* 0..1: 開くアニメーション */
-        float g_PageAnim  = 1.0f;  /* ページ切り替え時のぽよん */
-        float g_HoldTime  = 0.0f;  /* 左右を押し続けている時間 */
-        float g_HoldAccum = 0.0f;
+    ImU32 HueColor(float h) {
+        float r, g, b;
+        ImGui::ColorConvertHSVtoRGB(h, 1.0f, 1.0f, r, g, b);
+        return ImGui::GetColorU32(ImVec4(r, g, b, 1.0f));
     }
 
-    const char* const MainItems[]  = { "INK COLOR", "REPLAY INTRO", "CLOSE MENU" };
-    const char* const ColorItems[] = { "TEAM", "OVERRIDE", "RED", "GREEN", "BLUE", "BACK" };
-    constexpr int MainCount  = 3;
-    constexpr int ColorCount = 6;
-
-    void GoTo(Page p) {
-        menu::g_Page = p;
-        menu::g_Cursor = 0;
-        menu::g_PageAnim = 0.0f;
-    }
-
-    int ToByte(float v) { return (int) (Clamp01(v) * 255.0f + 0.5f); }
-
-    /* 左右で RGB の値を増減(押し続けると速くなる) */
-    void AdjustChannel(float& channel, float dt) {
-        int dir = 0;
-        if (HeldLeft()) dir = -1;
-        if (HeldRight()) dir = 1;
-        if (dir == 0) {
-            menu::g_HoldTime = 0.0f;
-            menu::g_HoldAccum = 0.0f;
-            return;
-        }
-
-        int value = ToByte(channel);
-        if (PressedLeft() || PressedRight()) {
-            value += dir;
-        } else {
-            menu::g_HoldTime += dt;
-            if (menu::g_HoldTime > 0.35f) {
-                float speed = 20.0f + 180.0f * Clamp01((menu::g_HoldTime - 0.35f) / 1.5f); /* 1秒あたり */
-                menu::g_HoldAccum += speed * dt;
-                int steps = (int) menu::g_HoldAccum;
-                menu::g_HoldAccum -= (float) steps;
-                value += dir * steps;
-            }
-        }
-        if (value < 0) value = 0;
-        if (value > 255) value = 255;
-        channel = (float) value / 255.0f;
-    }
-
-    void HandleInput(float dt) {
-        int count = menu::g_Page == Page::Main ? MainCount : ColorCount;
-
-        if (PressedUp())   menu::g_Cursor = (menu::g_Cursor + count - 1) % count;
-        if (PressedDown()) menu::g_Cursor = (menu::g_Cursor + 1) % count;
-
-        if (menu::g_Page == Page::Main) {
-            if (PressedDecide()) {
-                switch (menu::g_Cursor) {
-                    case 0: GoTo(Page::Color); break;
-                    case 1: intro::Restart(); CloseMenu(); break;
-                    case 2: CloseMenu(); break;
-                }
-            }
-            if (PressedBack()) CloseMenu();
-            return;
-        }
-
-        /* 色のページ */
-        TeamOverride& o = g_Teams[menu::g_Team];
-        switch (menu::g_Cursor) {
-            case 0: /* TEAM */
-                if (PressedDecide() || PressedLeft() || PressedRight()) menu::g_Team ^= 1;
-                break;
-            case 1: /* OVERRIDE */
-                if (PressedDecide() || PressedLeft() || PressedRight()) o.enabled = !o.enabled;
-                break;
-            case 2: AdjustChannel(o.color[0], dt); break;
-            case 3: AdjustChannel(o.color[1], dt); break;
-            case 4: AdjustChannel(o.color[2], dt); break;
-            case 5: /* BACK */
-                if (PressedDecide()) GoTo(Page::Main);
-                break;
-        }
-        if (PressedBack()) GoTo(Page::Main);
-    }
-
-    /* ------------------------------------------------------------------ */
-    /*  描画                                                               */
-    /* ------------------------------------------------------------------ */
-
-    /* メニューを閉じているときの小さなタブ */
-    void DrawClosedTab(ImDrawList* dl, float unit, float time) {
-        Trap t{ ImVec2(24 * unit, 18 * unit), 250 * unit, 54 * unit, 0.0f };  /* 長方形 */
-        FillTrap(dl, ImVec2(t.Left(t.pos.y), t.pos.y), ImVec2(t.Right(t.pos.y), t.pos.y),
-                 ImVec2(t.pos.x + t.w, t.pos.y + t.h), ImVec2(t.pos.x, t.pos.y + t.h), pal::WithAlpha(pal::Ink, 0.75f));
-        FillBand(dl, t, t.pos.y, t.pos.y + 6 * unit, 0, pal::Pink);
-        DrawBouncyTitle(dl, "CHROMA RUSH", ImVec2(t.pos.x + t.w * 0.5f, t.pos.y + 22 * unit), 22 * unit, time, 1.0f);
-        const char* hint = "L3 + R3  OPEN";
-        float hs = 14 * unit;
-        Text(dl, hs, ImVec2(t.pos.x + (t.w - TextW(hs, hint)) * 0.5f, t.pos.y + 36 * unit), pal::WithAlpha(pal::Lime, 0.9f), hint);
-    }
-
-    /* 1行分(選択中はライムのピル) */
-    void DrawRow(ImDrawList* dl, const Trap& t, float y, float rowH, float unit, bool selected, float time,
-                 const char* label, const char* value, ImU32 valueCol) {
-        float pad = 18 * unit;
-        float y0 = y + 4 * unit, y1 = y + rowH - 4 * unit;
-        float fs = 24 * unit;
-        float ty = (y0 + y1) * 0.5f - fs * 0.5f;
-
-        if (selected) {
-            float wob = sinf(time * 8.0f) * 2.0f * unit;
-            FillBand(dl, t, y0 - wob * 0.5f, y1 + wob * 0.5f, pad, pal::Lime);
-            /* 跳ねる矢印 */
-            float ax = t.Left(y) + pad + 10 * unit + fabsf(sinf(time * 7.0f)) * 5 * unit;
-            float ay = (y0 + y1) * 0.5f;
-            dl->AddTriangleFilled(ImVec2(ax, ay - 8 * unit), ImVec2(ax + 12 * unit, ay), ImVec2(ax, ay + 8 * unit), pal::Ink);
-        } else {
-            FillBand(dl, t, y0, y1, pad, pal::WithAlpha(IM_COL32(255, 255, 255, 255), 0.08f));
-        }
-
-        ImU32 textCol = selected ? pal::Ink : pal::White;
-        Text(dl, fs, ImVec2(t.Left(y) + pad + 34 * unit, ty), textCol, label);
-        if (value) {
-            float vw = TextW(fs, value);
-            Text(dl, fs, ImVec2(t.Right(y) - pad - 18 * unit - vw, ty), selected ? pal::Ink : valueCol, value);
+    /* 虹色のバー */
+    void DrawRainbow(ImDrawList* dl, ImVec2 p0, ImVec2 p1) {
+        const int seg = 6;
+        float w = (p1.x - p0.x) / seg;
+        for (int i = 0; i < seg; i++) {
+            ImU32 a = HueColor((float) i / seg), b = HueColor((float) (i + 1) / seg);
+            dl->AddRectFilledMultiColor(ImVec2(p0.x + w * i, p0.y), ImVec2(p0.x + w * (i + 1) + 0.5f, p1.y), a, b, b, a);
         }
     }
 
-    /* RGB の行: 数値 + その色のバー */
-    void DrawChannelRow(ImDrawList* dl, const Trap& t, float y, float rowH, float unit, bool selected, float time,
-                        const char* label, float v, ImU32 chanCol) {
-        char buf[8];
-        snprintf(buf, sizeof(buf), "%3d", ToByte(v));
-        DrawRow(dl, t, y, rowH, unit, selected, time, label, buf, chanCol);
-
-        float pad = 18 * unit;
-        float bx0 = t.Left(y) + pad + 140 * unit;
-        float bx1 = t.Right(y) - pad - 80 * unit;
-        float by = y + rowH * 0.5f;
-        dl->AddRectFilled(ImVec2(bx0, by - 5 * unit), ImVec2(bx1, by + 5 * unit), pal::WithAlpha(pal::Ink, 0.6f), 5 * unit);
-        dl->AddRectFilled(ImVec2(bx0, by - 5 * unit), ImVec2(bx0 + (bx1 - bx0) * Clamp01(v), by + 5 * unit), chanCol, 5 * unit);
-        dl->AddCircleFilled(ImVec2(bx0 + (bx1 - bx0) * Clamp01(v), by), 8 * unit, pal::White, 16);
+    /* 暗い → あざやか → 白っぽい のバー */
+    void DrawShadeBar(ImDrawList* dl, ImVec2 p0, ImVec2 p1, float hue) {
+        float mx = (p0.x + p1.x) * 0.5f;
+        ImU32 c = HueColor(hue);
+        dl->AddRectFilledMultiColor(p0, ImVec2(mx, p1.y), bw::Black, c, c, bw::Black);
+        dl->AddRectFilledMultiColor(ImVec2(mx, p0.y), p1, c, bw::White, bw::White, c);
     }
 
-    void DrawMenu(ImDrawList* dl, float unit, float time) {
-        int count = menu::g_Page == Page::Main ? MainCount : ColorCount;
-        float rowH = 50 * unit;
-        float headerH = 78 * unit;
-        float previewH = menu::g_Page == Page::Color ? 96 * unit : 0.0f;
-        float footerH = (sync::g_Active ? 64 : 40) * unit;
-        float h = headerH + rowH * count + previewH + footerH + 16 * unit;
+    /* バーの上の目印 */
+    void DrawMarker(ImDrawList* dl, float x, float y0, float y1, float unit) {
+        dl->AddRectFilled(ImVec2(x - 3 * unit, y0 - 4 * unit), ImVec2(x + 3 * unit, y1 + 4 * unit), bw::White);
+        dl->AddRect(ImVec2(x - 3 * unit, y0 - 4 * unit), ImVec2(x + 3 * unit, y1 + 4 * unit), bw::Black, 0, 0, 1.5f * unit);
+    }
 
-        /* 開くとき: 上からぽよんと落ちてくる */
-        float open = EaseOutBack(menu::g_OpenAnim);
-        float drop = (1.0f - open) * -120 * unit;
-        Trap t{ ImVec2(36 * unit, 30 * unit + drop), 540 * unit, h, 0.0f };  /* 長方形(上と下が同じ長さ) */
+    struct Layout {
+        float x, w, unit, rowH, pad, fs;
+    };
 
-        ImVec2 tl(t.Left(t.pos.y), t.pos.y), tr(t.Right(t.pos.y), t.pos.y);
-        ImVec2 br(t.pos.x + t.w, t.pos.y + t.h), bl(t.pos.x, t.pos.y + t.h);
+    /* 1行分。選択中は白地に黒文字 */
+    void DrawRow(ImDrawList* dl, const Layout& L, float y, bool selected, const char* label, const char* value) {
+        float y0 = y + 3 * L.unit, y1 = y + L.rowH - 3 * L.unit;
+        if (selected) dl->AddRectFilled(ImVec2(L.x + L.pad * 0.5f, y0), ImVec2(L.x + L.w - L.pad * 0.5f, y1), bw::White);
+        ImU32 col = selected ? bw::Black : bw::White;
+        float ty = (y0 + y1) * 0.5f - L.fs * 0.5f;
+        Text(dl, L.fs, ImVec2(L.x + L.pad, ty), col, label);
+        if (value) Text(dl, L.fs, ImVec2(L.x + L.w - L.pad - TextW(L.fs, value), ty), selected ? bw::Black : bw::Gray, value);
+    }
 
-        /* 影 → 本体 → 枠 */
-        float sh = 8 * unit;
-        FillTrap(dl, ImVec2(tl.x + sh, tl.y + sh), ImVec2(tr.x + sh, tr.y + sh), ImVec2(br.x + sh, br.y + sh),
-                 ImVec2(bl.x + sh, bl.y + sh), pal::WithAlpha(IM_COL32(0, 0, 0, 255), 0.35f));
-        FillTrap(dl, tl, tr, br, bl, pal::WithAlpha(IM_COL32(30, 14, 58, 255), 0.94f));
+    /* バー付きの行(数字は出さない) */
+    template<typename BarFn>
+    void DrawBarRow(ImDrawList* dl, const Layout& L, float y, bool selected, const char* label, float t, BarFn drawBar) {
+        DrawRow(dl, L, y, selected, label, nullptr);
+        float bx0 = L.x + L.pad + 120 * L.unit, bx1 = L.x + L.w - L.pad - 6 * L.unit;
+        float cy = y + L.rowH * 0.5f;
+        ImVec2 b0(bx0, cy - 7 * L.unit), b1(bx1, cy + 7 * L.unit);
+        drawBar(b0, b1);
+        dl->AddRect(b0, b1, selected ? bw::Black : bw::Gray, 0, 0, 1.0f * L.unit);
+        DrawMarker(dl, bx0 + (bx1 - bx0) * Clamp01(t), b0.y, b1.y, L.unit);
+    }
 
-        /* ヘッダー帯(ピンク)と、そこから垂れるインク */
-        float hy1 = t.pos.y + headerH - 14 * unit;
-        FillBand(dl, t, t.pos.y, hy1, 0, pal::Pink);
-        for (int i = 0; i < 7; i++) {
-            float x = t.Left(hy1) + (t.Right(hy1) - t.Left(hy1)) * (0.08f + 0.14f * i);
-            float len = (6.0f + 7.0f * (float) ((i * 5) % 3) + sinf(time * 2.0f + i) * 3.0f) * unit;
-            dl->AddRectFilled(ImVec2(x - 5 * unit, hy1 - 2 * unit), ImVec2(x + 5 * unit, hy1 + len), pal::Pink, 5 * unit);
-            dl->AddCircleFilled(ImVec2(x, hy1 + len), 6 * unit, pal::Pink, 16);
+    /* メニューを閉じているときの小さな表示 */
+    void DrawClosedTab(ImDrawList* dl, float unit) {
+        const char* s = "CHROMA RUSH   L : MENU";
+        float fs = 14 * unit;
+        ImVec2 p0(20 * unit, 16 * unit);
+        ImVec2 p1(p0.x + TextW(fs, s) + 20 * unit, p0.y + fs + 12 * unit);
+        dl->AddRectFilled(p0, p1, IM_COL32(0, 0, 0, 160));
+        Text(dl, fs, ImVec2(p0.x + 10 * unit, p0.y + 6 * unit), IM_COL32(255, 255, 255, 200), s);
+    }
+
+    void DrawMenu(ImDrawList* dl, float unit) {
+        bool colorPage = menu::g_Page == Page::Color;
+        int count = colorPage ? ColorCount : MainCount;
+        Layout L{ 36 * unit, 460 * unit, unit, 44 * unit, 18 * unit, 20 * unit };
+
+        float headerH = 54 * unit;
+        float previewH = colorPage ? 70 * unit : 0.0f;
+        float footerH = (sync::g_Active ? 54 : 34) * unit;
+        float h = headerH + L.rowH * count + previewH + footerH;
+        float top = 30 * unit;
+
+        float alpha = Clamp01(menu::g_OpenTime / 0.15f);
+        ImU32 panel = pal::WithAlpha(bw::Panel, 0.9f * alpha);
+
+        /* 本体(長方形) + 白い枠 */
+        dl->AddRectFilled(ImVec2(L.x, top), ImVec2(L.x + L.w, top + h), panel);
+        dl->AddRect(ImVec2(L.x, top), ImVec2(L.x + L.w, top + h), bw::White, 0, 0, 2 * unit);
+
+        /* ヘッダー: タイトル + 区切り線 */
+        const char* title = colorPage ? "INK COLOR" : "CHROMA RUSH";
+        float ts = 26 * unit;
+        Text(dl, ts, ImVec2(L.x + L.pad, top + (headerH - ts) * 0.5f), bw::White, title);
+        if (colorPage) {
+            const char* sub = "< L-STICK";
+            float ss = 14 * unit;
+            Text(dl, ss, ImVec2(L.x + L.w - L.pad - TextW(ss, sub), top + (headerH - ss) * 0.5f), bw::Gray, sub);
         }
-        const char* title = menu::g_Page == Page::Main ? "CHROMA RUSH" : "INK COLOR";
-        float pop = EaseOutBack(menu::g_PageAnim);
-        DrawBouncyTitle(dl, title, ImVec2(t.pos.x + t.w * 0.5f, t.pos.y + 32 * unit), 36 * unit * (0.6f + 0.4f * pop), time, 1.0f);
+        dl->AddLine(ImVec2(L.x + L.pad * 0.5f, top + headerH - 1 * unit), ImVec2(L.x + L.w - L.pad * 0.5f, top + headerH - 1 * unit), bw::White, 1.5f * unit);
 
-        /* 行 */
-        float y = t.pos.y + headerH;
-        if (menu::g_Page == Page::Main) {
-            for (int i = 0; i < MainCount; i++, y += rowH) {
-                DrawRow(dl, t, y, rowH, unit, menu::g_Cursor == i, time, MainItems[i], i == 0 ? ">" : nullptr, pal::Cyan);
+        float y = top + headerH;
+        if (!colorPage) {
+            for (int i = 0; i < MainCount; i++, y += L.rowH) {
+                DrawRow(dl, L, y, menu::g_Cursor == i, MainItems[i], i == 0 ? ">" : nullptr);
             }
         } else {
             TeamOverride& o = g_Teams[menu::g_Team];
-            char teamBuf[24];
-            snprintf(teamBuf, sizeof(teamBuf), "< %s >", menu::g_Team == 0 ? "ALPHA" : "BRAVO");
-            DrawRow(dl, t, y, rowH, unit, menu::g_Cursor == 0, time, ColorItems[0], teamBuf, pal::Cyan);  y += rowH;
-            DrawRow(dl, t, y, rowH, unit, menu::g_Cursor == 1, time, ColorItems[1], o.enabled ? "ON" : "OFF",
-                    o.enabled ? pal::Lime : pal::WithAlpha(pal::White, 0.5f));                            y += rowH;
-            DrawChannelRow(dl, t, y, rowH, unit, menu::g_Cursor == 2, time, ColorItems[2], o.color[0], IM_COL32(255, 70, 90, 255));  y += rowH;
-            DrawChannelRow(dl, t, y, rowH, unit, menu::g_Cursor == 3, time, ColorItems[3], o.color[1], IM_COL32(90, 230, 90, 255));  y += rowH;
-            DrawChannelRow(dl, t, y, rowH, unit, menu::g_Cursor == 4, time, ColorItems[4], o.color[2], IM_COL32(80, 140, 255, 255)); y += rowH;
-            DrawRow(dl, t, y, rowH, unit, menu::g_Cursor == 5, time, ColorItems[5], nullptr, pal::White);  y += rowH;
+            Picker& p = GetPicker(menu::g_Team);
 
-            /* プレビュー: いまの色 → 新しい色 */
+            DrawRow(dl, L, y, menu::g_Cursor == 0, ColorItems[0], menu::g_Team == 0 ? "< ALPHA >" : "< BRAVO >"); y += L.rowH;
+            DrawRow(dl, L, y, menu::g_Cursor == 1, ColorItems[1], o.enabled ? "ON" : "OFF");                    y += L.rowH;
+            DrawBarRow(dl, L, y, menu::g_Cursor == 2, ColorItems[2], p.hue,
+                       [&](ImVec2 b0, ImVec2 b1) { DrawRainbow(dl, b0, b1); });                             y += L.rowH;
+            DrawBarRow(dl, L, y, menu::g_Cursor == 3, ColorItems[3], (p.shade + 1.0f) * 0.5f,
+                       [&](ImVec2 b0, ImVec2 b1) { DrawShadeBar(dl, b0, b1, p.hue); });                   y += L.rowH;
+
+            /* プレビュー: NOW → NEW */
             teamcolor::Color4f* base = GetBaseColor(menu::g_Team);
-            ImU32 nowCol = base ? ImGui::GetColorU32(ImVec4(base->r, base->g, base->b, 1.0f)) : pal::WithAlpha(pal::White, 0.3f);
+            ImU32 nowCol = base ? ImGui::GetColorU32(ImVec4(base->r, base->g, base->b, 1.0f)) : bw::Gray;
             ImU32 newCol = ImGui::GetColorU32(ImVec4(o.color[0], o.color[1], o.color[2], 1.0f));
-            float cy = y + previewH * 0.5f;
-            float cx = t.pos.x + t.w * 0.5f;
-            float r = 26 * unit;
-            DrawSplat(dl, ImVec2(cx - 110 * unit, cy), r, nowCol, 2);
-            DrawSplat(dl, ImVec2(cx + 110 * unit, cy), r * (1.0f + 0.06f * sinf(time * 5.0f)), newCol, 5);
-            dl->AddTriangleFilled(ImVec2(cx - 14 * unit, cy - 12 * unit), ImVec2(cx + 14 * unit, cy), ImVec2(cx - 14 * unit, cy + 12 * unit), pal::Lime);
-            float ls = 16 * unit;
-            Text(dl, ls, ImVec2(cx - 110 * unit - TextW(ls, "NOW") * 0.5f, cy + r + 10 * unit), pal::WithAlpha(pal::White, 0.8f), "NOW");
-            Text(dl, ls, ImVec2(cx + 110 * unit - TextW(ls, "NEW") * 0.5f, cy + r + 10 * unit), pal::WithAlpha(pal::White, 0.8f), "NEW");
+            float sz = 34 * unit;
+            float cy = y + (previewH - sz) * 0.5f - 4 * unit;
+            float cx = L.x + L.w * 0.5f;
+            ImVec2 n0(cx - 90 * unit - sz * 0.5f, cy), w0(cx + 90 * unit - sz * 0.5f, cy);
+            dl->AddRectFilled(n0, ImVec2(n0.x + sz, n0.y + sz), nowCol);
+            dl->AddRect(n0, ImVec2(n0.x + sz, n0.y + sz), bw::White, 0, 0, 1.5f * unit);
+            dl->AddRectFilled(w0, ImVec2(w0.x + sz, w0.y + sz), newCol);
+            dl->AddRect(w0, ImVec2(w0.x + sz, w0.y + sz), bw::White, 0, 0, 1.5f * unit);
+            float ls = 13 * unit;
+            Text(dl, ls, ImVec2(n0.x + (sz - TextW(ls, "NOW")) * 0.5f, n0.y + sz + 4 * unit), bw::Gray, "NOW");
+            Text(dl, ls, ImVec2(w0.x + (sz - TextW(ls, "NEW")) * 0.5f, w0.y + sz + 4 * unit), bw::Gray, "NEW");
+            Text(dl, 18 * unit, ImVec2(cx - TextW(18 * unit, ">") * 0.5f, cy + sz * 0.5f - 9 * unit), bw::White, ">");
             y += previewH;
         }
 
-        /* メモリ同期の進み具合 */
+        /* 下: 同期の進み具合 + 操作ガイド */
+        float gs = 13 * unit;
+        float gy = top + h - 22 * unit;
         if (sync::g_Active) {
-            char sbuf[48];
+            char sbuf[40];
             snprintf(sbuf, sizeof(sbuf), "SYNCING COLORS  %d%%", (int) (sync::Progress() * 100.0f));
-            float ss = 16 * unit;
-            float sy = t.pos.y + t.h - footerH - ss * 0.5f;
-            Text(dl, ss, ImVec2(t.pos.x + (t.w - TextW(ss, sbuf)) * 0.5f, sy), pal::Lime, sbuf);
+            Text(dl, gs, ImVec2(L.x + L.pad, gy - 20 * unit), bw::White, sbuf);
         }
-
-        /* 操作ガイド */
-        const char* guide = "D-PAD MOVE   L SELECT   L-STICK LEFT BACK";
-        float gs = 16 * unit;
-        float gy = t.pos.y + t.h - footerH * 0.5f - gs * 0.5f - 4 * unit;
-        Text(dl, gs, ImVec2(t.pos.x + (t.w - TextW(gs, guide)) * 0.5f, gy), pal::WithAlpha(pal::Cyan, 0.9f), guide);
-
-        OutlineTrap(dl, tl, tr, br, bl, pal::Pink, 4 * unit);
+        const char* guide = colorPage ? "L SELECT   D-PAD ADJUST   L-STICK LEFT BACK" : "L SELECT   L-STICK LEFT CLOSE";
+        Text(dl, gs, ImVec2(L.x + L.pad, gy), bw::Gray, guide);
     }
 
     void OnPreInit() {}
@@ -790,22 +797,24 @@ namespace chroma {
 
         ImGuiIO& io = ImGui::GetIO();
         float dt = io.DeltaTime > 0.0f && io.DeltaTime < 0.25f ? io.DeltaTime : (1.0f / 60.0f);
-        float time = (float) ImGui::GetTime();
         float unit = io.DisplaySize.y / 720.0f;
         ImDrawList* dl = ImGui::GetForegroundDrawList();
 
         if (!IsMenuOpen()) {
-            menu::g_OpenAnim = 0.0f;
-            DrawClosedTab(dl, unit, time);
+            menu::g_WasOpen = false;
+            DrawClosedTab(dl, unit);
             return;
         }
 
-        if (menu::g_OpenAnim == 0.0f) GoTo(Page::Main);
-        menu::g_OpenAnim = Clamp01(menu::g_OpenAnim + dt / 0.35f);
-        menu::g_PageAnim = Clamp01(menu::g_PageAnim + dt / 0.3f);
+        if (!menu::g_WasOpen) {
+            GoTo(Page::Main);
+            menu::g_OpenTime = 0.0f;
+            menu::g_WasOpen = true;
+        }
+        menu::g_OpenTime += dt;
 
         HandleInput(dt);
-        if (IsMenuOpen()) DrawMenu(dl, unit, time);
+        if (IsMenuOpen()) DrawMenu(dl, unit);
     }
 
 }
@@ -829,30 +838,51 @@ namespace nn::hid {
 }
 
 namespace chroma {
-    /* NpadBaseState: +0x08 ボタン, +0x10 左スティック, +0x18 右スティック(1つ 0x28 バイト) */
-    void BlockPadStates(void* states, int count) {
-        if (!InputHelper::toggleInput || InputHelper::isReadInput || states == nullptr) return;
+    /*
+     * NpadBaseState: +0x08 ボタン, +0x10 左スティック, +0x18 右スティック(1つ 0x28 バイト)
+     * ボタンのビット: L = 6
+     */
+    constexpr u64 ButtonL = 1ull << 6;
+    bool g_PrevL[5] = {};
+
+    void BlockPadStates(int kind, void* states, int count) {
+        if (states == nullptr || count <= 0 || InputHelper::isReadInput) return;
+        u8* first = reinterpret_cast<u8*>(states);
+
+        /* メニューが閉じているとき: L を押した瞬間にメニューを開く(その L はゲームに渡さない) */
+        if (!InputHelper::toggleInput) {
+            u64 buttons;
+            std::memcpy(&buttons, first + 0x08, sizeof(buttons));
+            bool l = (buttons & ButtonL) != 0;
+            bool pressed = l && !g_PrevL[kind];
+            g_PrevL[kind] = l;
+            if (!pressed || intro::g_Active) return;
+            OpenMenu();
+        } else {
+            g_PrevL[kind] = true;  /* 閉じた直後に、押しっぱなしの L で開き直さない */
+        }
+
+        /* メニュー操作中: ボタンとスティックをゲームに渡さない */
         for (int i = 0; i < count; i++) {
-            u8* s = reinterpret_cast<u8*>(states) + i * 0x28;
-            std::memset(s + 0x08, 0, 0x18);
+            std::memset(first + i * 0x28 + 0x08, 0, 0x18);
         }
     }
 }
 
-#define DEFINE_PAD_HOOK(Name, StateType)                                              \
+#define DEFINE_PAD_HOOK(Name, StateType, Kind)                                        \
     HOOK_DEFINE_TRAMPOLINE(Name) {                                                    \
         static int Callback(nn::hid::StateType* states, int count, const unsigned int& port) { \
             int r = Orig(states, count, port);                                        \
-            chroma::BlockPadStates(states, count);                                    \
+            chroma::BlockPadStates(Kind, states, count);                              \
             return r;                                                                 \
         }                                                                             \
     }
 
-DEFINE_PAD_HOOK(PadFullKeyHook,  NpadFullKeyState);
-DEFINE_PAD_HOOK(PadHandheldHook, NpadHandheldState);
-DEFINE_PAD_HOOK(PadJoyDualHook,  NpadJoyDualState);
-DEFINE_PAD_HOOK(PadJoyLeftHook,  NpadJoyLeftState);
-DEFINE_PAD_HOOK(PadJoyRightHook, NpadJoyRightState);
+DEFINE_PAD_HOOK(PadFullKeyHook,  NpadFullKeyState,  0);
+DEFINE_PAD_HOOK(PadHandheldHook, NpadHandheldState, 1);
+DEFINE_PAD_HOOK(PadJoyDualHook,  NpadJoyDualState,  2);
+DEFINE_PAD_HOOK(PadJoyLeftHook,  NpadJoyLeftState,  3);
+DEFINE_PAD_HOOK(PadJoyRightHook, NpadJoyRightState, 4);
 
 /* チームの色をセットする関数 (main 0x13cb40c) */
 HOOK_DEFINE_TRAMPOLINE(TeamColorSetHook) {
