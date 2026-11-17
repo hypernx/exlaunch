@@ -18,6 +18,8 @@ jobs:
       - name: Build imgui-xeno
         run: |
           git config --global --add safe.directory '*'
+          # Splatoon 3 向けの修正(専用コマンドバッファで描画)を当てる
+          git -C libs/imgui-xeno apply ../../patches/imgui-xeno.patch
           cmake -S libs/imgui-xeno -B libs/imgui-xeno/build \
             -DCMAKE_TOOLCHAIN_FILE=$PWD/libs/imgui-xeno/cmake/toolchain.cmake \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo
@@ -41,3 +43,8 @@ jobs:
         with:
           name: splatoon3-plugin
           path: sd/
+      # クラッシュ解析用(SDカードには入れない)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debug-elf
+          path: "*.elf"

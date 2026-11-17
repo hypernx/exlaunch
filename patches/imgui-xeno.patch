@@ -1,0 +1,181 @@
+diff --git a/src/imgui_backend/imgui_impl_nvn.cpp b/src/imgui_backend/imgui_impl_nvn.cpp
+index d6d8e6f..65e4d05 100644
+--- a/src/imgui_backend/imgui_impl_nvn.cpp
++++ b/src/imgui_backend/imgui_impl_nvn.cpp
+@@ -47,6 +47,8 @@ void orthoRH_ZO(Matrix44f &Result, float left, float right, float bottom, float
+   Result[3][3] = 1.0f;
+ }
+ 
++extern nvn::Texture *gImGuiRenderTarget;
++
+ namespace ImguiNvnBackend {
+   void loadIni();
+   void saveIni();
+@@ -696,6 +698,11 @@ namespace ImguiNvnBackend {
+ 
+     bd->cmdBuf->BeginRecording(); // start recording our commands to the cmd buffer
+ 
++    // CHROMA: 描画先を表示用テクスチャに明示的に設定する
++    if (gImGuiRenderTarget) {
++      bd->cmdBuf->SetRenderTargets(1, &gImGuiRenderTarget, nullptr, nullptr, nullptr);
++    }
++
+     bd->cmdBuf->BindProgram(&bd->shaderProgram, nvn::ShaderStageBits::VERTEX |
+                                                 nvn::ShaderStageBits::FRAGMENT); // bind main imgui shader
+ 
+diff --git a/src/imgui_backend/imgui_nvn.cpp b/src/imgui_backend/imgui_nvn.cpp
+index 9abf3c5..7bc2ec9 100644
+--- a/src/imgui_backend/imgui_nvn.cpp
++++ b/src/imgui_backend/imgui_nvn.cpp
+@@ -29,6 +29,25 @@ nvn::CommandBufferSetSamplerPoolFunc tempCommandSetSamplerPoolFunc;
+ bool hasInitImGui = false;
+ int commandBufferCount = 0;
+ 
++// CHROMA: ImGui 専用のコマンドバッファ。ゲームのコマンドバッファには触らない。
++static nvn::CommandBuffer sImGuiCmdBuf;
++static nvn::MemoryPool sImGuiCmdPool;
++static void *sImGuiCtrlMem = nullptr;
++static bool sImGuiCmdBufReady = false;
++static int sImGuiFrame = 0;
++static constexpr size_t kCmdSliceSize = 0x40000;  // 256KB / frame
++static constexpr size_t kCtrlSliceSize = 0x10000; // 64KB / frame
++static constexpr int kSliceCount = 3;
++
++// CHROMA: ウィンドウ(画面)のテクスチャ。表示直前にここへ ImGui を描く。
++static nvn::Texture *sWindowTextures[8] = {};
++static int sWindowTextureCount = 0;
++static int sCropW = 0;
++static int sCropH = 0;
++nvn::Texture *gImGuiRenderTarget = nullptr;
++
++nvn::WindowBuilderSetTexturesFunc tempWindowBuilderSetTexturesFunc;
++
+ namespace nvnImGui {
+   ImVector<ProcDrawFunc> drawQueue;
+   ImVector<InitFunc> preInitQueue;
+@@ -49,7 +68,18 @@ void setSamplerPool(nvn::CommandBuffer *cmdBuf, const nvn::SamplerPool *pool) {
+   tempCommandSetSamplerPoolFunc(cmdBuf, pool);
+ }
+ 
++void windowBuilderSetTextures(nvn::WindowBuilder *builder, int count, nvn::Texture *const *textures) {
++  sWindowTextureCount = 0;
++  for (int i = 0; i < count && i < 8; i++) {
++    sWindowTextures[i] = textures[i];
++    sWindowTextureCount++;
++  }
++  tempWindowBuilderSetTexturesFunc(builder, count, textures);
++}
++
+ void setCrop(nvn::Window *window, int x, int y, int w, int h) {
++  sCropW = w - x;
++  sCropH = h - y;
+ 
+   Logger::log("Window Crop: x: %d y: %d w: %d h: %d\n", x, y, w, h);
+ 
+@@ -61,28 +91,60 @@ void setCrop(nvn::Window *window, int x, int y, int w, int h) {
+ 
+ void presentTexture(nvn::Queue *queue, nvn::Window *window, int texIndex) {
+ 
+-  // save state; modified by procDraw
+-  auto *buf = __cmdBuf;
+-  auto *pool = __texturePool;
+-  auto *samplerPool = __samplerPool;
++  // CHROMA: 専用コマンドバッファで、表示されるテクスチャに直接 ImGui を描く
++  if (hasInitImGui && sImGuiCmdBufReady && texIndex >= 0 && texIndex < sWindowTextureCount) {
++    nvn::Texture *target = sWindowTextures[texIndex];
++    if (target) {
++      int slice = sImGuiFrame++ % kSliceCount;
++      sImGuiCmdBuf.AddCommandMemory(&sImGuiCmdPool, slice * kCmdSliceSize, kCmdSliceSize);
++      sImGuiCmdBuf.AddControlMemory((u8 *) sImGuiCtrlMem + slice * kCtrlSliceSize, kCtrlSliceSize);
++
++      ImGuiIO &io = ImGui::GetIO();
++      if (sCropW > 0 && sCropH > 0) {
++        io.DisplaySize = ImVec2(sCropW, sCropH);
++      } else {
++        io.DisplaySize = ImVec2(target->GetWidth(), target->GetHeight());
++      }
++
++      gImGuiRenderTarget = target;
++      nvnImGui::procDraw();
++      gImGuiRenderTarget = nullptr;
++    }
++  }
+ 
+-  // end previous recording (we dont need to submit)
+-  buf->EndRecording();
++  tempPresentTexFunc(queue, window, texIndex);
++}
+ 
+-  if (hasInitImGui)
+-    nvnImGui::procDraw();
++static bool createImGuiCmdBuf(nvn::Device *device) {
++  Mem::Init();
+ 
+-  // restore state
+-  buf->BeginRecording();
+-  setTexturePool(buf, pool);
+-  setSamplerPool(buf, samplerPool);
+-  auto handle = buf->EndRecording();
+-  queue->SubmitCommands(1, &handle);
++  if (!tempBufferInitFuncPtr(&sImGuiCmdBuf, device)) {
++    Logger::log("CHROMA: failed to init ImGui command buffer\n");
++    return false;
++  }
++
++  size_t poolSize = kCmdSliceSize * kSliceCount;
++  void *poolMem = Mem::AllocateAlign(0x1000, poolSize);
++  sImGuiCtrlMem = Mem::AllocateAlign(0x1000, kCtrlSliceSize * kSliceCount);
++  if (!poolMem || !sImGuiCtrlMem) {
++    Logger::log("CHROMA: failed to allocate command memory\n");
++    return false;
++  }
+ 
+-  // start new recording back up (for next frame)
+-  buf->BeginRecording();
++  nvn::MemoryPoolBuilder builder{};
++  builder.SetDefaults()
++      .SetDevice(device)
++      .SetFlags(nvn::MemoryPoolFlags::CPU_UNCACHED | nvn::MemoryPoolFlags::GPU_CACHED)
++      .SetStorage(poolMem, poolSize);
++  if (!sImGuiCmdPool.Initialize(&builder)) {
++    Logger::log("CHROMA: failed to init command memory pool\n");
++    return false;
++  }
+ 
+-  tempPresentTexFunc(queue, window, texIndex);
++  sImGuiCmdBuf.AddCommandMemory(&sImGuiCmdPool, 0, kCmdSliceSize);
++  sImGuiCmdBuf.AddControlMemory(sImGuiCtrlMem, kCtrlSliceSize);
++  sImGuiCmdBufReady = true;
++  return true;
+ }
+ 
+ NVNboolean deviceInit(nvn::Device *device, const nvn::DeviceBuilder *builder) {
+@@ -102,13 +164,12 @@ NVNboolean queueInit(nvn::Queue *queue, const nvn::QueueBuilder *builder) {
+ NVNboolean cmdBufInit(nvn::CommandBuffer *buffer, nvn::Device *device) {
+   NVNboolean result = tempBufferInitFuncPtr(buffer, device);
+ 
+-  if (!hasInitImGui) {
+-    // XENO: wait for the right command buffer
+-    if (commandBufferCount++ != IMGUI_XENO_COMMAND_BUFFER_ID) {
+-      return result;
++  if (!hasInitImGui && !sImGuiCmdBufReady && nvnDevice && nvnQueue) {
++    // CHROMA: ゲームのコマンドバッファではなく、専用のものを作って使う
++    if (createImGuiCmdBuf(device)) {
++      nvnCmdBuf = &sImGuiCmdBuf;
++      hasInitImGui = nvnImGui::InitImGui();
+     }
+-    nvnCmdBuf = buffer;
+-    hasInitImGui = nvnImGui::InitImGui();
+   }
+ 
+   return result;
+@@ -135,6 +196,9 @@ nvn::GenericFuncPtrFunc getProc(nvn::Device *device, const char *procName) {
+   } else if (strcmp(procName, "nvnCommandBufferSetTexturePool") == 0) {
+     tempCommandSetTexturePoolFunc = (nvn::CommandBufferSetTexturePoolFunc) ptr;
+     return (nvn::GenericFuncPtrFunc) &setTexturePool;
++  } else if (strcmp(procName, "nvnWindowBuilderSetTextures") == 0) {
++    tempWindowBuilderSetTexturesFunc = (nvn::WindowBuilderSetTexturesFunc) ptr;
++    return (nvn::GenericFuncPtrFunc) &windowBuilderSetTextures;
+   } else if (strcmp(procName, "nvnWindowSetCrop") == 0) {
+     tempSetCropFunc = (nvn::WindowSetCropFunc) ptr;
+     return (nvn::GenericFuncPtrFunc) &setCrop;
