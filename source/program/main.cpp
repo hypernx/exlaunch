@@ -48,9 +48,6 @@ namespace chroma {
         const char* name;
         bool  enabled  = false;
         float color[3] = { 1.0f, 1.0f, 1.0f };
-        /* 有効にした時点の元の色(無効に戻すときに使う) */
-        bool  hasBackup = false;
-        teamcolor::Color4f backup[teamcolor::KindCount] = {};
     };
 
     TeamOverride g_Teams[teamcolor::TeamCount] = {
@@ -58,31 +55,96 @@ namespace chroma {
         { "Bravo", false, { 0.10f, 0.40f, 1.00f } },
     };
 
-    /* 毎フレーム呼ぶ。有効なチームの色を書き換え、無効にしたら元に戻す。 */
-    void ApplyTeamColors() {
-        for (int team = 0; team < teamcolor::TeamCount; team++) {
-            TeamOverride& o = g_Teams[team];
-            teamcolor::Color4f* block = teamcolor::GetTeamBlock(team);
-            if (block == nullptr) continue;
+    /*
+     * ゲームの「チームの色をセットする関数」(0x13cb40c)。
+     *   void Set(Color4f* block, const Color4f* baseColor, u64 a, u64 b, float f)
+     * 基本色(sRGB)から 17 種類の色バリエーションを計算して block に書き込む。
+     * 表は 8 ブロック(4 チーム × 2 セット)ある。
+     */
+    using SetBlockFn = void (*)(teamcolor::Color4f*, const teamcolor::Color4f*, u64, u64, float);
+    SetBlockFn g_OrigSetBlock = nullptr;
 
-            if (o.enabled) {
-                if (!o.hasBackup) {
-                    for (int k = 0; k < teamcolor::KindCount; k++) o.backup[k] = block[k];
-                    o.hasBackup = true;
+    constexpr int SetCount = 2;   /* 表のセット数 */
+    constexpr int SetTeams = 4;   /* 1セットあたりのチーム数 */
+
+    /* ゲームが最後にセットしたときの引数(色を作り直すために使う) */
+    struct BlockState {
+        bool  valid = false;
+        teamcolor::Color4f original{};  /* ゲーム本来の基本色 */
+        u64   a = 0, b = 0;
+        float f = 0.0f;
+    };
+    BlockState g_Blocks[teamcolor::TeamCount][SetCount];
+
+    teamcolor::Color4f* GetBlock(int team, int set) {
+        teamcolor::Color4f* base = teamcolor::GetTeamBlock(0);
+        if (base == nullptr) return nullptr;
+        auto* p = reinterpret_cast<u8*>(base) + (team + set * SetTeams) * teamcolor::TeamStride;
+        return reinterpret_cast<teamcolor::Color4f*>(p);
+    }
+
+    /* ブロック内の基本色(+0x110) */
+    teamcolor::Color4f* GetBaseColor(int team) {
+        teamcolor::Color4f* block = GetBlock(team, 0);
+        return block ? reinterpret_cast<teamcolor::Color4f*>(reinterpret_cast<u8*>(block) + 0x110) : nullptr;
+    }
+
+    /* フックから呼ばれる: ゲームが色をセットするとき、上書き中なら自分の色にすり替える */
+    void OnSetBlock(teamcolor::Color4f* block, const teamcolor::Color4f* color, u64 a, u64 b, float f) {
+        for (int team = 0; team < teamcolor::TeamCount; team++) {
+            for (int set = 0; set < SetCount; set++) {
+                if (block != GetBlock(team, set)) continue;
+
+                BlockState& s = g_Blocks[team][set];
+                s.valid = true;
+                s.original = *color;
+                s.a = a; s.b = b; s.f = f;
+
+                const TeamOverride& o = g_Teams[team];
+                if (o.enabled) {
+                    teamcolor::Color4f mine{ o.color[0], o.color[1], o.color[2], color->a };
+                    g_OrigSetBlock(block, &mine, a, b, f);
+                    return;
                 }
-                for (int k = 0; k < teamcolor::KindCount; k++) {
-                    block[k].r = o.color[0];
-                    block[k].g = o.color[1];
-                    block[k].b = o.color[2];
-                    /* アルファ(不透明度)は元のまま */
-                }
-            } else if (o.hasBackup) {
-                /* ゲームがまだ書き換えていなければ(自分の色のままなら)元に戻す */
-                if (block[0].r == o.color[0] && block[0].g == o.color[1] && block[0].b == o.color[2]) {
-                    for (int k = 0; k < teamcolor::KindCount; k++) block[k] = o.backup[k];
-                }
-                o.hasBackup = false;
+                g_OrigSetBlock(block, color, a, b, f);
+                return;
             }
+        }
+        g_OrigSetBlock(block, color, a, b, f);
+    }
+
+    /* メニューで変えた色を、ゲームと同じ計算ですぐに作り直す */
+    void ReapplyTeam(int team) {
+        if (g_OrigSetBlock == nullptr) return;
+        const TeamOverride& o = g_Teams[team];
+        for (int set = 0; set < SetCount; set++) {
+            BlockState& s = g_Blocks[team][set];
+            teamcolor::Color4f* block = GetBlock(team, set);
+            if (!s.valid || block == nullptr) continue;
+            if (o.enabled) {
+                teamcolor::Color4f mine{ o.color[0], o.color[1], o.color[2], s.original.a };
+                g_OrigSetBlock(block, &mine, s.a, s.b, s.f);
+            } else {
+                g_OrigSetBlock(block, &s.original, s.a, s.b, s.f);
+            }
+        }
+    }
+
+    /* 毎フレーム呼ぶ。設定が変わったチームだけ作り直す。 */
+    void ApplyTeamColors() {
+        static bool  lastEnabled[teamcolor::TeamCount] = {};
+        static float lastColor[teamcolor::TeamCount][3] = {};
+        for (int team = 0; team < teamcolor::TeamCount; team++) {
+            const TeamOverride& o = g_Teams[team];
+            bool changed = o.enabled != lastEnabled[team];
+            if (o.enabled) {
+                for (int c = 0; c < 3; c++) changed |= o.color[c] != lastColor[team][c];
+            }
+            if (!changed) continue;
+
+            ReapplyTeam(team);
+            lastEnabled[team] = o.enabled;
+            for (int c = 0; c < 3; c++) lastColor[team][c] = o.color[c];
         }
     }
 
@@ -273,12 +335,13 @@ namespace chroma {
     bool Pressed(ImGuiKey k, bool repeat = true) { return ImGui::IsKeyPressed(k, repeat); }
     bool PressedUp()    { return Pressed(ImGuiKey_GamepadDpadUp)    || Pressed(ImGuiKey_GamepadLStickUp); }
     bool PressedDown()  { return Pressed(ImGuiKey_GamepadDpadDown)  || Pressed(ImGuiKey_GamepadLStickDown); }
-    bool HeldLeft()     { return ImGui::IsKeyDown(ImGuiKey_GamepadDpadLeft)  || ImGui::IsKeyDown(ImGuiKey_GamepadLStickLeft); }
-    bool HeldRight()    { return ImGui::IsKeyDown(ImGuiKey_GamepadDpadRight) || ImGui::IsKeyDown(ImGuiKey_GamepadLStickRight); }
-    bool PressedLeft()  { return Pressed(ImGuiKey_GamepadDpadLeft, false)  || Pressed(ImGuiKey_GamepadLStickLeft, false); }
-    bool PressedRight() { return Pressed(ImGuiKey_GamepadDpadRight, false) || Pressed(ImGuiKey_GamepadLStickRight, false); }
-    bool PressedDecide(){ return Pressed(ImGuiKey_GamepadL1, false); }        /* L で決定 */
-    bool PressedBack()  { return Pressed(ImGuiKey_GamepadFaceRight, false); } /* B で戻る */
+    /* 値の増減は十字キーの左右だけ(左スティックの左は「戻る」に使う) */
+    bool HeldLeft()     { return ImGui::IsKeyDown(ImGuiKey_GamepadDpadLeft); }
+    bool HeldRight()    { return ImGui::IsKeyDown(ImGuiKey_GamepadDpadRight); }
+    bool PressedLeft()  { return Pressed(ImGuiKey_GamepadDpadLeft, false); }
+    bool PressedRight() { return Pressed(ImGuiKey_GamepadDpadRight, false); }
+    bool PressedDecide(){ return Pressed(ImGuiKey_GamepadL1, false); }          /* L で決定 */
+    bool PressedBack()  { return Pressed(ImGuiKey_GamepadLStickLeft, false); }  /* 左スティックを左に倒すと戻る/閉じる */
 
     /* ------------------------------------------------------------------ */
     /*  台形パネル(上の辺が短い)                                         */
@@ -526,8 +589,8 @@ namespace chroma {
             DrawRow(dl, t, y, rowH, unit, menu::g_Cursor == 5, time, ColorItems[5], nullptr, pal::White);  y += rowH;
 
             /* プレビュー: いまの色 → 新しい色 */
-            teamcolor::Color4f* block = teamcolor::GetTeamBlock(menu::g_Team);
-            ImU32 nowCol = block ? ImGui::GetColorU32(ImVec4(block[0].r, block[0].g, block[0].b, 1.0f)) : pal::WithAlpha(pal::White, 0.3f);
+            teamcolor::Color4f* base = GetBaseColor(menu::g_Team);
+            ImU32 nowCol = base ? ImGui::GetColorU32(ImVec4(base->r, base->g, base->b, 1.0f)) : pal::WithAlpha(pal::White, 0.3f);
             ImU32 newCol = ImGui::GetColorU32(ImVec4(o.color[0], o.color[1], o.color[2], 1.0f));
             float cy = y + previewH * 0.5f;
             float cx = t.pos.x + t.w * 0.5f;
@@ -542,7 +605,7 @@ namespace chroma {
         }
 
         /* 操作ガイド */
-        const char* guide = "D-PAD MOVE   L SELECT   B BACK";
+        const char* guide = "D-PAD MOVE   L SELECT   L-STICK LEFT BACK";
         float gs = 16 * unit;
         float gy = t.pos.y + t.h - footerH * 0.5f - gs * 0.5f - 4 * unit;
         Text(dl, gs, ImVec2(t.pos.x + (t.w - TextW(gs, guide)) * 0.5f, gy), pal::WithAlpha(pal::Cyan, 0.9f), guide);
@@ -631,6 +694,17 @@ DEFINE_PAD_HOOK(PadJoyDualHook,  NpadJoyDualState);
 DEFINE_PAD_HOOK(PadJoyLeftHook,  NpadJoyLeftState);
 DEFINE_PAD_HOOK(PadJoyRightHook, NpadJoyRightState);
 
+/* チームの色をセットする関数 (main 0x13cb40c) */
+HOOK_DEFINE_TRAMPOLINE(TeamColorSetHook) {
+    static void CallOrig(chroma::teamcolor::Color4f* block, const chroma::teamcolor::Color4f* color, u64 a, u64 b, float f) {
+        Orig(block, color, a, b, f);
+    }
+
+    static void Callback(chroma::teamcolor::Color4f* block, const chroma::teamcolor::Color4f* color, u64 a, u64 b, float f) {
+        chroma::OnSetBlock(block, color, a, b, f);
+    }
+};
+
 /* nvnBootstrapLoader は sdk から公開されている。 */
 extern "C" void* nvnBootstrapLoader(const char* name);
 
@@ -653,6 +727,9 @@ extern "C" void exl_main(void* x0, void* x1) {
     imgui_xeno_init(&chroma::OnPostInit, &chroma::OnRender);
 
     NvnBootstrapHook::InstallAtFuncPtr(nvnBootstrapLoader);
+
+    chroma::g_OrigSetBlock = &TeamColorSetHook::CallOrig;
+    TeamColorSetHook::InstallAtOffset(0x13cb40c);
 
     using FullKeyFn  = int (*)(nn::hid::NpadFullKeyState*, int, const unsigned int&);
     using HandheldFn = int (*)(nn::hid::NpadHandheldState*, int, const unsigned int&);
