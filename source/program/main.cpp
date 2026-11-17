@@ -119,7 +119,8 @@ namespace chroma {
     namespace sync {
         struct Pair { u32 o[4]; u32 n[4]; };
         constexpr int MaxPairs = teamcolor::TeamCount * SetCount * BlockColors;
-        constexpr size_t BytesPerFrame = 12u << 20;
+        constexpr size_t ChunkBytes   = 256u << 10;  /* 256KB ずつ */
+        constexpr u64    TicksPerFrame = 19200000ull / 1000ull;  /* 1フレームあたり最大 1ms (19.2MHz) */
 
         Pair      g_Pairs[MaxPairs];
         int       g_PairCount = 0;
@@ -139,6 +140,8 @@ namespace chroma {
 
         bool Scannable(const MemoryInfo& mi) {
             if ((mi.perm & Perm_Rw) != Perm_Rw) return false;
+            /* キャッシュされないメモリ(GPU用など)は読むのが非常に遅いので飛ばす */
+            if (mi.attr & MemAttr_IsUncached) return false;
             switch (mi.type & MemState_Type) {
                 case MemType_Normal: case MemType_CodeMutable: case MemType_Heap:
                 case MemType_ModuleCodeMutable: case MemType_MappedMemory:
@@ -212,8 +215,8 @@ namespace chroma {
 
         void Step() {
             if (!g_Active) return;
-            size_t budget = BytesPerFrame;
-            while (budget > 0) {
+            u64 start = svcGetSystemTick();
+            while (svcGetSystemTick() - start < TicksPerFrame) {
                 if (g_Cur >= g_End && !NextRegion()) {
                     g_Active = false;
                     g_LastReplaced = g_Replaced;
@@ -224,9 +227,9 @@ namespace chroma {
                 if (R_FAILED(svcQueryMemory(&mi, &pi, g_Cur)) || !Scannable(mi)) { g_Cur = g_End; continue; }
                 uintptr_t limit = mi.addr + mi.size < g_End ? mi.addr + mi.size : g_End;
                 size_t len = limit - g_Cur;
-                if (len > budget) len = budget;
+                if (len > ChunkBytes) len = ChunkBytes;
                 ScanRange(g_Cur, len);
-                g_Cur += len; g_Done += len; budget -= len;
+                g_Cur += len; g_Done += len;
             }
         }
 

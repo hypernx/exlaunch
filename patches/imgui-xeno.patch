@@ -179,3 +179,15 @@ index 9abf3c5..7bc2ec9 100644
    } else if (strcmp(procName, "nvnWindowSetCrop") == 0) {
      tempSetCropFunc = (nvn::WindowSetCropFunc) ptr;
      return (nvn::GenericFuncPtrFunc) &setCrop;
+diff --git a/user_config/imgui_backend_config.h b/user_config/imgui_backend_config.h
+index fbbf970..ca6e835 100644
+--- a/user_config/imgui_backend_config.h
++++ b/user_config/imgui_backend_config.h
+@@ -62,5 +62,5 @@
+ 
+ // Logs messages using system calls. If a logger is provided with imgui_xeno_set_logger, it will be used instead.
+ #ifndef IMGUI_XENO_LOG_SVC
+-#define IMGUI_XENO_LOG_SVC true
++#define IMGUI_XENO_LOG_SVC false
+ #endif
+\ No newline at end of file
