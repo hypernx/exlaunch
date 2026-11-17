@@ -124,7 +124,7 @@ namespace chroma {
             bool half;            /* 半精度でも探すか */
         };
         constexpr int MaxPairs = teamcolor::TeamCount * SetCount * BlockColors;
-        constexpr size_t ChunkBytes   = 256u << 10;  /* 256KB ずつ */
+        constexpr size_t ChunkBytes   = 64u << 10;   /* 64KB ずつ(読む前に毎回、領域がまだあるか確認する) */
 
         Pair      g_Pairs[MaxPairs];
         int       g_PairCount = 0;
@@ -155,10 +155,13 @@ namespace chroma {
             /* キャッシュされないメモリ(GPU用など)は読むのが遅いので、2周目にまわす */
             bool uncached = (mi.attr & MemAttr_IsUncached) != 0;
             if (uncached != (g_Pass == 1)) return false;
+            /*
+             * 途中で消えることのないメモリだけを探す。
+             * (Normal / MappedMemory / TransferMem はゲームやシステムが途中で外すことがあり、
+             *  読んでいる最中に消えるとクラッシュする)
+             */
             switch (mi.type & MemState_Type) {
-                case MemType_Normal: case MemType_CodeMutable: case MemType_Heap:
-                case MemType_ModuleCodeMutable: case MemType_MappedMemory:
-                case MemType_TransferMem: case MemType_TransferMemIsolated:
+                case MemType_Heap: case MemType_CodeMutable: case MemType_ModuleCodeMutable:
                     break;
                 default:
                     return false;
