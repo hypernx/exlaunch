@@ -274,10 +274,13 @@ namespace chroma {
             __atomic_store_n(&g_Indexing, false, __ATOMIC_RELEASE);
         }
 
+        void (*g_ExtraJob)() = nullptr;  /* 値さがし */
+
         void Worker(void*) {
             while (true) {
                 if (__atomic_exchange_n(&g_Request, false, __ATOMIC_ACQ_REL)) RunIndex();
-                else nn::os::SleepThread(nn::TimeSpan::FromMilliSeconds(20));
+                else if (g_ExtraJob) g_ExtraJob();
+                nn::os::SleepThread(nn::TimeSpan::FromMilliSeconds(20));
             }
         }
 
@@ -295,6 +298,223 @@ namespace chroma {
         float Progress() { return g_Total ? Clamp01((float) g_Done / (float) g_Total) : 0.0f; }
         bool  Indexing() { return __atomic_load_n(&g_Indexing, __ATOMIC_ACQUIRE); }
         bool  Ready()    { return __atomic_load_n(&g_Ready, __ATOMIC_ACQUIRE); }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*  値さがし(スペシャルゲージなどの場所をゲーム中に絞り込む)          */
+    /* ------------------------------------------------------------------ */
+
+}
+
+namespace nn::nifm { bool IsNetworkAvailable(); }
+namespace nn::ldn  { int GetState(); }
+namespace nn::ro   { Result LookupSymbol(uintptr_t* out, const char* name); }
+
+namespace chroma {
+
+    /* 対戦に影響する機能は、通信しているときは動かさない */
+    bool IsOnline() {
+        if (nn::nifm::IsNetworkAvailable()) return true;
+        int st = nn::ldn::GetState();  /* 2..5: ローカル通信中 */
+        return st >= 2 && st <= 5;
+    }
+
+    namespace search {
+        enum Kind : u8 { S32 = 0, F32 = 1, Ratio = 2 };  /* 整数 / 小数 / 割合(満タン = 1.0) */
+        enum Op { New, EqFull, EqZero, Increased, Decreased, Unchanged };
+
+        struct Cand { uintptr_t addr; u32 last; u8 kind; bool lock; };
+
+        Cand*  g_Cands = nullptr;
+        int    g_Cap = 0;
+        int    g_Count = 0;
+        bool   g_TooMany = false;
+        bool   g_HasScan = false;
+        int    g_Value = 200;      /* メニューで決める値(満タンのときのポイント) */
+        bool   g_AlsoRatio = true; /* 満タン = 1.0 の小数も探す */
+        int    g_ScanValue = 200;
+        bool   g_ScanRatio = true;
+
+        bool   g_Busy = false;
+        bool   g_Request = false;
+        Op     g_Op = New;
+        u64    g_Total = 0, g_Done = 0;
+
+        bool Alloc() {
+            if (g_Cands) return true;
+            uintptr_t fn = 0;
+            if (R_FAILED(nn::ro::LookupSymbol(&fn, "malloc")) || fn == 0) return false;
+            auto mallocFn = reinterpret_cast<void* (*)(size_t)>(fn);
+            for (int cap = 393216; cap >= 32768; cap /= 2) {  /* 6MB から、だめなら小さく */
+                void* p = mallocFn(sizeof(Cand) * (size_t) cap);
+                if (p) { g_Cands = reinterpret_cast<Cand*>(p); g_Cap = cap; return true; }
+            }
+            return false;
+        }
+
+        /* ゲームのデータが入る、途中で消えないメモリだけ */
+        bool Searchable(const MemoryInfo& mi) {
+            if ((mi.perm & Perm_Rw) != Perm_Rw) return false;
+            if ((mi.type & MemState_Type) != MemType_Heap) return false;
+            const auto& self = exl::util::GetSelfModuleInfo().m_Total;
+            if (mi.addr < self.GetEnd() && mi.addr + mi.size > self.m_Start) return false;
+            return true;
+        }
+
+        /* addr がまだ読めるか(候補はアドレス順なので、領域ごとに1回だけ確かめる) */
+        struct RegionCache {
+            uintptr_t start = 0, end = 0;
+            bool ok = false;
+            bool Check(uintptr_t addr) {
+                if (addr >= start && addr + 4 <= end) return ok;
+                MemoryInfo mi{}; u32 pi;
+                if (R_FAILED(svcQueryMemory(&mi, &pi, addr))) { start = end = 0; ok = false; return false; }
+                start = mi.addr; end = mi.addr + mi.size; ok = Searchable(mi);
+                return ok && addr + 4 <= end;
+            }
+        };
+
+        u32 FullBits(const Cand& c) {
+            if (c.kind == S32) { u32 u = (u32) g_ScanValue; return u; }
+            if (c.kind == F32) return sync::Bits((float) g_ScanValue);
+            return 0x3F800000u;  /* 1.0f */
+        }
+
+        bool Greater(const Cand& c, u32 a, u32 b) {  /* a > b ? */
+            if (c.kind == S32) return (s32) a > (s32) b;
+            float fa, fb; std::memcpy(&fa, &a, 4); std::memcpy(&fb, &b, 4);
+            return fa > fb;
+        }
+
+        void Push(uintptr_t addr, u32 v, u8 kind) {
+            if (g_Count >= g_Cap) { g_TooMany = true; return; }
+            g_Cands[g_Count++] = { addr, v, kind, false };
+        }
+
+        void RunNew() {
+            g_Count = 0; g_TooMany = false;
+            g_ScanValue = g_Value; g_ScanRatio = g_AlsoRatio;
+            u32 s = (u32) g_ScanValue, f = sync::Bits((float) g_ScanValue), r = 0x3F800000u;
+
+            /* 全体の大きさ(進み具合の表示用) */
+            g_Total = 0; g_Done = 0;
+            for (uintptr_t next = 0;;) {
+                MemoryInfo mi{}; u32 pi;
+                if (R_FAILED(svcQueryMemory(&mi, &pi, next))) break;
+                uintptr_t end = mi.addr + mi.size;
+                if (mi.size == 0 || end <= next) break;
+                next = end;
+                if (Searchable(mi)) g_Total += mi.size;
+            }
+
+            size_t sinceYield = 0;
+            for (uintptr_t next = 0; !g_TooMany;) {
+                MemoryInfo mi{}; u32 pi;
+                if (R_FAILED(svcQueryMemory(&mi, &pi, next))) break;
+                uintptr_t end = mi.addr + mi.size;
+                if (mi.size == 0 || end <= next) break;
+                next = end;
+                if (!Searchable(mi)) continue;
+                for (uintptr_t cur = mi.addr; cur < end && !g_TooMany; cur += 0x10000) {
+                    uintptr_t lim = cur + 0x10000 < end ? cur + 0x10000 : end;
+                    const volatile u32* p = reinterpret_cast<const volatile u32*>(cur);
+                    size_t n = (lim - cur) / 4;
+                    for (size_t i = 0; i < n; i++) {
+                        u32 w = p[i];
+                        if (w == s) Push(cur + i * 4, w, S32);
+                        else if (w == f) Push(cur + i * 4, w, F32);
+                        else if (g_ScanRatio && w == r) Push(cur + i * 4, w, Ratio);
+                    }
+                    g_Done += lim - cur;
+                    sinceYield += lim - cur;
+                    if (sinceYield >= (1u << 20)) { sinceYield = 0; nn::os::YieldThread(); }
+                }
+            }
+            g_HasScan = !g_TooMany;
+            if (g_TooMany) g_Count = 0;
+        }
+
+        void RunNext(Op op) {
+            RegionCache rc;
+            int out = 0;
+            g_Total = (u64) g_Count; g_Done = 0;
+            for (int i = 0; i < g_Count; i++, g_Done++) {
+                Cand c = g_Cands[i];
+                if (!rc.Check(c.addr)) continue;
+                u32 v = *reinterpret_cast<const volatile u32*>(c.addr);
+                bool keep = false;
+                switch (op) {
+                    case EqFull:    keep = v == FullBits(c); break;
+                    case EqZero:    keep = v == 0; break;
+                    case Increased: keep = Greater(c, v, c.last); break;
+                    case Decreased: keep = Greater(c, c.last, v); break;
+                    case Unchanged: keep = v == c.last; break;
+                    default: break;
+                }
+                if (!keep) continue;
+                c.last = v;
+                g_Cands[out++] = c;
+                if ((i & 0xFFFF) == 0) nn::os::YieldThread();
+            }
+            g_Count = out;
+        }
+
+        void Job() {
+            if (!__atomic_exchange_n(&g_Request, false, __ATOMIC_ACQ_REL)) return;
+            if (g_Op == New) RunNew(); else RunNext(g_Op);
+            __atomic_store_n(&g_Busy, false, __ATOMIC_RELEASE);
+        }
+
+        bool Busy() { return __atomic_load_n(&g_Busy, __ATOMIC_ACQUIRE); }
+
+        void Request(Op op) {
+            if (Busy()) return;
+            if (op != New && !g_HasScan) return;
+            if (!Alloc()) { g_TooMany = true; return; }
+            g_Op = op;
+            __atomic_store_n(&g_Busy, true, __ATOMIC_RELEASE);
+            sync::g_ExtraJob = &Job;
+            sync::StartWorker();
+            __atomic_store_n(&g_Request, true, __ATOMIC_RELEASE);
+        }
+
+        float Progress() { return g_Total ? Clamp01((float) g_Done / (float) g_Total) : 0.0f; }
+
+        /*
+         * 見つかった場所が、どのオブジェクトの何番目の値かを推測する。
+         * オブジェクトの先頭には、たいてい main の中を指すポインタ(vtable)がある。
+         * いちばん近いものを探して「main からの位置」と「そこからの距離」を返す。
+         */
+        bool FindOwner(uintptr_t addr, uintptr_t& vtOff, uintptr_t& field) {
+            uintptr_t mainStart = exl::util::modules::GetTargetStart();
+            uintptr_t lo = mainStart + 0x4e90000, hi = mainStart + 0x6100000;
+            MemoryInfo mi{}; u32 pi;
+            if (R_FAILED(svcQueryMemory(&mi, &pi, addr)) || !Searchable(mi)) return false;
+            uintptr_t a = addr & ~(uintptr_t) 7;
+            for (uintptr_t back = 0; back <= 0x2000 && a - back >= mi.addr; back += 8) {
+                u64 q = *reinterpret_cast<const volatile u64*>(a - back);
+                if (q >= lo && q < hi) {
+                    vtOff = q - mainStart;
+                    field = addr - (a - back);
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /* 固定した値を毎フレーム書き戻す(オフラインのときだけ) */
+        void ApplyLocks() {
+            if (g_Busy || g_Count > 6) return;
+            bool online = IsOnline();
+            for (int i = 0; i < g_Count; i++) {
+                Cand& c = g_Cands[i];
+                if (!c.lock) continue;
+                if (online) { c.lock = false; continue; }
+                MemoryInfo mi{}; u32 pi;
+                if (R_FAILED(svcQueryMemory(&mi, &pi, c.addr)) || !Searchable(mi)) { c.lock = false; continue; }
+                *reinterpret_cast<volatile u32*>(c.addr) = FullBits(c);
+            }
+        }
     }
 
     /* 控えの色(いまゲームの中に写されている色)を探す準備をして、裏方に頼む */
@@ -710,7 +930,7 @@ namespace chroma {
     /*  メニューの状態                                                     */
     /* ------------------------------------------------------------------ */
 
-    enum class Page { Main, Color };
+    enum class Page { Main, Color, Search };
 
     namespace menu {
         Page  g_Page     = Page::Main;
@@ -721,9 +941,9 @@ namespace chroma {
         float g_HoldTime = 0.0f;
     }
 
-    const char* const MainItems[]  = { "INK COLOR", "REPLAY INTRO" };
+    const char* const MainItems[]  = { "INK COLOR", "VALUE SEARCH", "REPLAY INTRO" };
     const char* const ColorItems[] = { "TEAM", "OVERRIDE", "COLOR", "SHADE" };
-    constexpr int MainCount  = 2;
+    constexpr int MainCount  = 3;
     constexpr int ColorCount = 4;
 
     void GoTo(Page p) {
@@ -757,8 +977,56 @@ namespace chroma {
         return true;
     }
 
+    const char* const SearchItems[] = { "VALUE", "ALSO 1.0", "NEW SCAN", "= VALUE (FULL)", "= 0 (EMPTY)",
+                                        "INCREASED", "DECREASED", "UNCHANGED" };
+    constexpr int SearchItemCount = 8;
+
+    int SearchResultsShown() {
+        return (!search::Busy() && search::g_HasScan && search::g_Count <= 6) ? search::g_Count : 0;
+    }
+
+    void HandleSearchInput(float dt, bool canDecide) {
+        static float hold = 0.0f;
+        int c = menu::g_Cursor;
+        if (c == 0) {  /* VALUE: 左右で ±1、押し続けると速く */
+            int dir = HeldRight() ? 1 : (HeldLeft() ? -1 : 0);
+            if (dir == 0) { hold = 0.0f; }
+            else if (PressedLeft() || PressedRight()) { search::g_Value += dir; }
+            else {
+                hold += dt;
+                if (hold > 0.3f) search::g_Value += dir * (hold > 1.5f ? 10 : 1);
+            }
+            if (search::g_Value < 1) search::g_Value = 1;
+            if (search::g_Value > 9999) search::g_Value = 9999;
+            return;
+        }
+        if (c == 1) {
+            if ((canDecide && PressedDecide()) || PressedLeft() || PressedRight()) search::g_AlsoRatio = !search::g_AlsoRatio;
+            return;
+        }
+        if (!canDecide || !PressedDecide()) return;
+        switch (c) {
+            case 2: search::Request(search::New); break;
+            case 3: search::Request(search::EqFull); break;
+            case 4: search::Request(search::EqZero); break;
+            case 5: search::Request(search::Increased); break;
+            case 6: search::Request(search::Decreased); break;
+            case 7: search::Request(search::Unchanged); break;
+            default: {
+                int r = c - SearchItemCount;
+                if (r >= 0 && r < SearchResultsShown() && !IsOnline()) {
+                    search::g_Cands[r].lock = !search::g_Cands[r].lock;
+                }
+                break;
+            }
+        }
+    }
+
     void HandleInput(float dt) {
-        int count = menu::g_Page == Page::Main ? MainCount : ColorCount;
+        int count = menu::g_Page == Page::Main ? MainCount
+                  : menu::g_Page == Page::Color ? ColorCount
+                  : SearchItemCount + SearchResultsShown();
+        if (menu::g_Cursor >= count) menu::g_Cursor = count - 1;
         bool canDecide = menu::g_OpenTime > 0.25f;  /* 開いたときの L を決定と間違えない */
 
         if (PressedUp())   menu::g_Cursor = (menu::g_Cursor + count - 1) % count;
@@ -768,10 +1036,17 @@ namespace chroma {
             if (canDecide && PressedDecide()) {
                 switch (menu::g_Cursor) {
                     case 0: GoTo(Page::Color); break;
-                    case 1: intro::Restart(); CloseMenu(); break;
+                    case 1: GoTo(Page::Search); break;
+                    case 2: intro::Restart(); CloseMenu(); break;
                 }
             }
             if (PressedBack()) CloseMenu();
+            return;
+        }
+
+        if (menu::g_Page == Page::Search) {
+            HandleSearchInput(dt, canDecide);
+            if (PressedBack()) GoTo(Page::Main);
             return;
         }
 
@@ -879,7 +1154,63 @@ namespace chroma {
         Text(dl, fs, ImVec2(p0.x + 10 * unit, p0.y + 6 * unit), IM_COL32(255, 255, 255, 200), s);
     }
 
+    void DrawSearchPage(ImDrawList* dl, float unit) {
+        int results = SearchResultsShown();
+        Layout L{ 36 * unit, 560 * unit, unit, 32 * unit, 16 * unit, 17 * unit };
+        float headerH = 48 * unit, statusH = 30 * unit, footerH = 30 * unit;
+        float h = headerH + L.rowH * (SearchItemCount + results) + statusH + footerH;
+        float top = 24 * unit;
+
+        float alpha = Clamp01(menu::g_OpenTime / 0.15f);
+        dl->AddRectFilled(ImVec2(L.x, top), ImVec2(L.x + L.w, top + h), pal::WithAlpha(bw::Panel, 0.9f * alpha));
+        dl->AddRect(ImVec2(L.x, top), ImVec2(L.x + L.w, top + h), bw::White, 0, 0, 2 * unit);
+        float ts = 22 * unit;
+        Text(dl, ts, ImVec2(L.x + L.pad, top + (headerH - ts) * 0.5f), bw::White, "VALUE SEARCH");
+        dl->AddLine(ImVec2(L.x + L.pad * 0.5f, top + headerH - 1 * unit), ImVec2(L.x + L.w - L.pad * 0.5f, top + headerH - 1 * unit), bw::White, 1.5f * unit);
+
+        float y = top + headerH;
+        char buf[96];
+        for (int i = 0; i < SearchItemCount; i++, y += L.rowH) {
+            const char* val = nullptr;
+            if (i == 0) { snprintf(buf, sizeof(buf), "< %d >", search::g_Value); val = buf; }
+            if (i == 1) val = search::g_AlsoRatio ? "ON" : "OFF";
+            DrawRow(dl, L, y, menu::g_Cursor == i, SearchItems[i], val);
+        }
+
+        /* 結果(6件以下になったら一覧。L で固定 ON/OFF) */
+        for (int r = 0; r < results; r++, y += L.rowH) {
+            const search::Cand& c = search::g_Cands[r];
+            u32 v = c.last;
+            {
+                MemoryInfo mi{}; u32 pi;
+                if (R_SUCCEEDED(svcQueryMemory(&mi, &pi, c.addr)) && search::Searchable(mi)) v = *reinterpret_cast<const volatile u32*>(c.addr);
+            }
+            char vs[24];
+            if (c.kind == search::S32) snprintf(vs, sizeof(vs), "%d", (int) (s32) v);
+            else { float f; std::memcpy(&f, &v, 4); snprintf(vs, sizeof(vs), "%.3f", f); }
+            uintptr_t vt = 0, field = 0;
+            char owner[40] = "VT ?";
+            if (search::FindOwner(c.addr, vt, field)) snprintf(owner, sizeof(owner), "VT %lx +%lx", (unsigned long) vt, (unsigned long) field);
+            const char* kind = c.kind == search::S32 ? "INT" : (c.kind == search::F32 ? "FLT" : "1.0");
+            snprintf(buf, sizeof(buf), "%s %s  %s", kind, vs, owner);
+            DrawRow(dl, L, y, menu::g_Cursor == SearchItemCount + r, buf, c.lock ? "LOCK" : nullptr);
+        }
+
+        /* 状態 */
+        float gs = 14 * unit;
+        float sy = y + 6 * unit;
+        if (search::Busy()) snprintf(buf, sizeof(buf), "SEARCHING...  %d%%", (int) (search::Progress() * 100.0f));
+        else if (search::g_TooMany) snprintf(buf, sizeof(buf), "TOO MANY RESULTS - TURN 'ALSO 1.0' OFF OR CHANGE VALUE");
+        else if (!search::g_HasScan) snprintf(buf, sizeof(buf), "SET VALUE, THEN NEW SCAN");
+        else snprintf(buf, sizeof(buf), "FOUND: %d", search::g_Count);
+        Text(dl, gs, ImVec2(L.x + L.pad, sy), IsOnline() ? bw::Gray : bw::White, buf);
+
+        const char* guide = IsOnline() ? "ONLINE: LOCK DISABLED" : "L SELECT   D-PAD ADJUST   L-STICK LEFT BACK";
+        Text(dl, 13 * unit, ImVec2(L.x + L.pad, top + h - 22 * unit), bw::Gray, guide);
+    }
+
     void DrawMenu(ImDrawList* dl, float unit) {
+        if (menu::g_Page == Page::Search) { DrawSearchPage(dl, unit); return; }
         bool colorPage = menu::g_Page == Page::Color;
         int count = colorPage ? ColorCount : MainCount;
         Layout L{ 36 * unit, 460 * unit, unit, 44 * unit, 18 * unit, 20 * unit };
@@ -911,7 +1242,7 @@ namespace chroma {
         float y = top + headerH;
         if (!colorPage) {
             for (int i = 0; i < MainCount; i++, y += L.rowH) {
-                DrawRow(dl, L, y, menu::g_Cursor == i, MainItems[i], i == 0 ? ">" : nullptr);
+                DrawRow(dl, L, y, menu::g_Cursor == i, MainItems[i], i <= 1 ? ">" : nullptr);
             }
         } else {
             TeamOverride& o = g_Teams[menu::g_Team];
@@ -965,6 +1296,7 @@ namespace chroma {
     void OnNewFrame() {
         ImGuiIO& io = ImGui::GetIO();
         ApplyTeamColors(io.DeltaTime > 0.0f && io.DeltaTime < 0.25f ? io.DeltaTime : (1.0f / 60.0f));
+        search::ApplyLocks();
     }
 
     void OnRender() {
