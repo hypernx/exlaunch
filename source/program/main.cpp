@@ -356,6 +356,65 @@ namespace chroma {
         }
     }
 
+    /*
+     * 地面のインクなど「材質」の色。
+     * 材質が作られるとき、ゲームは 0x1346ba0 で色見本帳からチームの色を読み、
+     * 材質のパラメータに書いて「更新済み」の印を付ける。その後は読み直さない。
+     * そこで呼ばれたときの引数を覚えておき、色を変えたらもう一度呼んでもらう。
+     */
+    namespace paint {
+        using Fn = void (*)(void*, void*, void*);
+        Fn g_Orig = nullptr;
+
+        struct Rec { void* self; void* arg; void* state; uintptr_t check0; uintptr_t check48; };
+        constexpr int MaxRecs = 2048;
+        Rec  g_Recs[MaxRecs];
+        int  g_Count = 0;
+
+        bool Readable(const void* p, size_t n) {
+            MemoryInfo mi{}; u32 pi;
+            uintptr_t a = reinterpret_cast<uintptr_t>(p);
+            if (a == 0 || (a & 7)) return false;
+            if (R_FAILED(svcQueryMemory(&mi, &pi, a))) return false;
+            if ((mi.perm & Perm_Rw) != Perm_Rw) return false;
+            if ((mi.type & MemState_Type) != MemType_Heap) return false;
+            return a + n <= mi.addr + mi.size;
+        }
+
+        uintptr_t Field(void* p, size_t off) { return *reinterpret_cast<uintptr_t*>(reinterpret_cast<u8*>(p) + off); }
+
+        void Record(void* self, void* arg, void* state) {
+            if (!Readable(state, 0x50)) return;
+            for (int i = 0; i < g_Count; i++) {
+                if (g_Recs[i].state == state && g_Recs[i].self == self) {
+                    g_Recs[i].arg = arg;
+                    g_Recs[i].check0 = Field(state, 0);
+                    g_Recs[i].check48 = Field(state, 0x48);
+                    return;
+                }
+            }
+            if (g_Count >= MaxRecs) return;
+            g_Recs[g_Count++] = { self, arg, state, Field(state, 0), Field(state, 0x48) };
+        }
+
+        void Clear() { g_Count = 0; }
+
+        /* 覚えておいた材質に、色見本帳の今の色をもう一度読んでもらう */
+        void RefreshAll() {
+            if (g_Orig == nullptr) return;
+            for (int i = 0; i < g_Count; i++) {
+                Rec& r = g_Recs[i];
+                if (r.state == nullptr) continue;
+                /* 材質がもう無い/別のものに変わっていたら外す */
+                if (!Readable(r.state, 0x50) || Field(r.state, 0) != r.check0 || Field(r.state, 0x48) != r.check48) {
+                    r.state = nullptr;
+                    continue;
+                }
+                g_Orig(r.self, r.arg, r.state);
+            }
+        }
+    }
+
     bool  g_EverUsed = false;     /* 一度でも OVERRIDE を使ったか(使っていなければ準備もしない) */
     float g_IndexDelay = -1.0f;   /* 試合の準備から、探し始めるまでの待ち時間 */
 
@@ -379,6 +438,7 @@ namespace chroma {
                 }
                 /* 試合の準備でセットされた色 = これからゲームが写す色。一覧は作り直し */
                 SnapshotBlock(team, set);
+                paint::Clear();
                 __atomic_store_n(&sync::g_Ready, false, __ATOMIC_RELEASE);
                 if (sync::Indexing()) __atomic_store_n(&sync::g_Stale, true, __ATOMIC_RELEASE);
                 g_IndexDelay = 4.0f;  /* キャラや地面が色を写し終わるのを待ってから探す */
@@ -411,6 +471,7 @@ namespace chroma {
         static bool  lastEnabled[teamcolor::TeamCount] = {};
         static float lastColor[teamcolor::TeamCount][3] = {};
         static bool  pending = false;
+        bool paintDirty = false;
 
         for (int team = 0; team < teamcolor::TeamCount; team++) {
             const TeamOverride& o = g_Teams[team];
@@ -422,10 +483,14 @@ namespace chroma {
             if (!changed) continue;
 
             ReapplyTeam(team);  /* 発射するインクなどはこれだけで変わる */
+            paintDirty = true;
             lastEnabled[team] = o.enabled;
             for (int c = 0; c < 3; c++) lastColor[team][c] = o.color[c];
             pending = true;
         }
+
+        /* 地面などの材質は、色見本帳を読み直してもらうだけで一瞬で変わる */
+        if (paintDirty) paint::RefreshAll();
 
         /* 試合が始まって少し待ったら、裏方で一覧を作っておく */
         if (g_IndexDelay >= 0.0f) {
@@ -1006,6 +1071,16 @@ HOOK_DEFINE_TRAMPOLINE(TeamColorSetHook) {
     }
 };
 
+/* 材質にチームの色を書く処理 (main 0x1346ba0) */
+HOOK_DEFINE_TRAMPOLINE(PaintColorParamHook) {
+    static void CallOrig(void* self, void* arg, void* state) { Orig(self, arg, state); }
+
+    static void Callback(void* self, void* arg, void* state) {
+        Orig(self, arg, state);
+        chroma::paint::Record(self, arg, state);
+    }
+};
+
 /* nvnBootstrapLoader は sdk から公開されている。 */
 extern "C" void* nvnBootstrapLoader(const char* name);
 
@@ -1031,6 +1106,9 @@ extern "C" void exl_main(void* x0, void* x1) {
 
     chroma::g_OrigSetBlock = &TeamColorSetHook::CallOrig;
     TeamColorSetHook::InstallAtOffset(0x13cb40c);
+
+    chroma::paint::g_Orig = &PaintColorParamHook::CallOrig;
+    PaintColorParamHook::InstallAtOffset(0x1346ba0);
 
     using FullKeyFn  = int (*)(nn::hid::NpadFullKeyState*, int, const unsigned int&);
     using HandheldFn = int (*)(nn::hid::NpadHandheldState*, int, const unsigned int&);
