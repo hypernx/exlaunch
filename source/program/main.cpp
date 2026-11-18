@@ -307,16 +307,17 @@ namespace chroma {
 }
 
 namespace nn::nifm { bool IsNetworkAvailable(); }
-namespace nn::ldn  { int GetState(); }
 namespace nn::ro   { Result LookupSymbol(uintptr_t* out, const char* name); }
 
 namespace chroma {
 
     /* 対戦に影響する機能は、通信しているときは動かさない */
     bool IsOnline() {
-        if (nn::nifm::IsNetworkAvailable()) return true;
-        int st = nn::ldn::GetState();  /* 2..5: ローカル通信中 */
-        return st >= 2 && st <= 5;
+        /*
+         * nn::ldn(ローカル通信)の状態は、ゲームがローカル通信を始める前に聞くと
+         * 止まってしまうので使わない。インターネットにつながっているかだけを見る。
+         */
+        return nn::nifm::IsNetworkAvailable();
     }
 
     namespace search {
@@ -504,7 +505,10 @@ namespace chroma {
 
         /* 固定した値を毎フレーム書き戻す(オフラインのときだけ) */
         void ApplyLocks() {
-            if (g_Busy || g_Count > 6) return;
+            if (g_Busy || g_Count > 6 || g_Cands == nullptr) return;
+            bool any = false;
+            for (int i = 0; i < g_Count; i++) any |= g_Cands[i].lock;
+            if (!any) return;  /* 固定しているものが無ければ何もしない */
             bool online = IsOnline();
             for (int i = 0; i < g_Count; i++) {
                 Cand& c = g_Cands[i];
