@@ -60,6 +60,10 @@ namespace chroma::probe {
     };
     constexpr int Count = sizeof(Defs) / sizeof(Defs[0]);
 
+    /* 回数を 0 に戻す(表示は「今の回数 - リセット時の回数」) */
+    u64 g_Base[8] = {};
+    void Reset() { for (int i = 0; i < 8; i++) g_Base[i] = g_ChromaProbe[i].count; }
+
     void Install() {
         for (int i = 0; i < Count; i++) {
             uintptr_t target = exl::util::modules::GetTargetOffset(Defs[i].offset);
@@ -1103,7 +1107,7 @@ namespace chroma {
         }
 
         if (menu::g_Page == Page::Probe) {
-            if (canDecide && PressedDecide()) ProbeReset();  /* L で 0 に戻す */
+            if (canDecide && PressedDecide()) probe::Reset();  /* L で 0 に戻す */
             if (PressedBack()) GoTo(Page::Main);
             return;
         }
@@ -1219,9 +1223,6 @@ namespace chroma {
     }
 
     /* 調査ページ: 回数は 0 に戻せる。表示は「回数」と「最後の呼び出し元(main からの位置)」 */
-    u64 g_ProbeBase[8] = {};
-    void ProbeReset() { for (int i = 0; i < 8; i++) g_ProbeBase[i] = g_ChromaProbe[i].count; }
-
     void DrawProbePage(ImDrawList* dl, float unit) {
         Layout L{ 36 * unit, 560 * unit, unit, 32 * unit, 16 * unit, 17 * unit };
         float headerH = 48 * unit, footerH = 30 * unit;
@@ -1238,7 +1239,7 @@ namespace chroma {
         float y = top + headerH;
         char buf[64];
         for (int i = 0; i < probe::Count; i++, y += L.rowH) {
-            u64 n = g_ChromaProbe[i].count - g_ProbeBase[i];
+            u64 n = g_ChromaProbe[i].count - probe::g_Base[i];
             u64 lr = g_ChromaProbe[i].lastLr;
             snprintf(buf, sizeof(buf), "%llu  <%lx", (unsigned long long) n, (unsigned long) (lr ? lr - mainStart : 0));
             DrawRow(dl, L, y, false, probe::Defs[i].name, buf);
