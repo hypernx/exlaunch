@@ -17,6 +17,58 @@
  * 操作: 左右のスティックを同時に押し込む (L3 + R3) と、コントローラーでメニューを操作できる。
  */
 
+/* ------------------------------------------------------------------ */
+/*  調査用: 候補の処理が呼ばれた回数と、呼び出し元を数える              */
+/*  (レジスタをほぼ触らない小さな入口を通して、元の処理へそのまま進む)  */
+/* ------------------------------------------------------------------ */
+
+struct ProbeSlot { u64 count; u64 lastLr; u64 tramp; u64 pad; };
+extern "C" ProbeSlot g_ChromaProbe[8];
+ProbeSlot g_ChromaProbe[8] = {};
+
+#define CHROMA_PROBE_STUB(N)                                              \
+    asm(".text\n.global chroma_probe_stub_" #N "\n"                     \
+        ".type chroma_probe_stub_" #N ", %function\n"                     \
+        "chroma_probe_stub_" #N ":\n"                                    \
+        "  adrp x16, g_ChromaProbe\n"                                    \
+        "  add  x16, x16, :lo12:g_ChromaProbe\n"                         \
+        "  add  x16, x16, #(" #N " * 32)\n"                              \
+        "  ldr  x17, [x16]\n"                                            \
+        "  add  x17, x17, #1\n"                                          \
+        "  str  x17, [x16]\n"                                            \
+        "  str  x30, [x16, #8]\n"                                        \
+        "  ldr  x17, [x16, #16]\n"                                       \
+        "  br   x17\n");                                                 \
+    extern "C" void chroma_probe_stub_##N();
+
+CHROMA_PROBE_STUB(0)
+CHROMA_PROBE_STUB(1)
+CHROMA_PROBE_STUB(2)
+CHROMA_PROBE_STUB(3)
+CHROMA_PROBE_STUB(4)
+CHROMA_PROBE_STUB(5)
+
+namespace chroma::probe {
+    struct Def { const char* name; uintptr_t offset; void (*stub)(); };
+    const Def Defs[] = {
+        { "A 284ced0 STATE",     0x284ced0, &chroma_probe_stub_0 },
+        { "B 293cfa8 FALL FX",   0x293cfa8, &chroma_probe_stub_1 },
+        { "C 28b9e18 FALL",      0x28b9e18, &chroma_probe_stub_2 },
+        { "D 2d845e0 REASON",    0x2d845e0, &chroma_probe_stub_3 },
+        { "E 34ac40c REASON",    0x34ac40c, &chroma_probe_stub_4 },
+        { "F 1e265a0 DETAIL",    0x1e265a0, &chroma_probe_stub_5 },
+    };
+    constexpr int Count = sizeof(Defs) / sizeof(Defs[0]);
+
+    void Install() {
+        for (int i = 0; i < Count; i++) {
+            uintptr_t target = exl::util::modules::GetTargetOffset(Defs[i].offset);
+            uintptr_t tramp = exl::hook::arch::Hook(target, reinterpret_cast<uintptr_t>(Defs[i].stub), true);
+            g_ChromaProbe[i].tramp = tramp;
+        }
+    }
+}
+
 namespace chroma {
 
     float Clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
@@ -934,7 +986,7 @@ namespace chroma {
     /*  メニューの状態                                                     */
     /* ------------------------------------------------------------------ */
 
-    enum class Page { Main, Color, Search };
+    enum class Page { Main, Color, Search, Probe };
 
     namespace menu {
         Page  g_Page     = Page::Main;
@@ -945,9 +997,9 @@ namespace chroma {
         float g_HoldTime = 0.0f;
     }
 
-    const char* const MainItems[]  = { "INK COLOR", "VALUE SEARCH", "REPLAY INTRO" };
+    const char* const MainItems[]  = { "INK COLOR", "VALUE SEARCH", "DEATH PROBE", "REPLAY INTRO" };
     const char* const ColorItems[] = { "TEAM", "OVERRIDE", "COLOR", "SHADE" };
-    constexpr int MainCount  = 3;
+    constexpr int MainCount  = 4;
     constexpr int ColorCount = 4;
 
     void GoTo(Page p) {
@@ -1029,6 +1081,7 @@ namespace chroma {
     void HandleInput(float dt) {
         int count = menu::g_Page == Page::Main ? MainCount
                   : menu::g_Page == Page::Color ? ColorCount
+                  : menu::g_Page == Page::Probe ? 1
                   : SearchItemCount + SearchResultsShown();
         if (menu::g_Cursor >= count) menu::g_Cursor = count - 1;
         bool canDecide = menu::g_OpenTime > 0.25f;  /* 開いたときの L を決定と間違えない */
@@ -1041,10 +1094,17 @@ namespace chroma {
                 switch (menu::g_Cursor) {
                     case 0: GoTo(Page::Color); break;
                     case 1: GoTo(Page::Search); break;
-                    case 2: intro::Restart(); CloseMenu(); break;
+                    case 2: GoTo(Page::Probe); break;
+                    case 3: intro::Restart(); CloseMenu(); break;
                 }
             }
             if (PressedBack()) CloseMenu();
+            return;
+        }
+
+        if (menu::g_Page == Page::Probe) {
+            if (canDecide && PressedDecide()) ProbeReset();  /* L で 0 に戻す */
+            if (PressedBack()) GoTo(Page::Main);
             return;
         }
 
@@ -1158,6 +1218,35 @@ namespace chroma {
         Text(dl, fs, ImVec2(p0.x + 10 * unit, p0.y + 6 * unit), IM_COL32(255, 255, 255, 200), s);
     }
 
+    /* 調査ページ: 回数は 0 に戻せる。表示は「回数」と「最後の呼び出し元(main からの位置)」 */
+    u64 g_ProbeBase[8] = {};
+    void ProbeReset() { for (int i = 0; i < 8; i++) g_ProbeBase[i] = g_ChromaProbe[i].count; }
+
+    void DrawProbePage(ImDrawList* dl, float unit) {
+        Layout L{ 36 * unit, 560 * unit, unit, 32 * unit, 16 * unit, 17 * unit };
+        float headerH = 48 * unit, footerH = 30 * unit;
+        float h = headerH + L.rowH * (probe::Count + 1) + footerH;
+        float top = 24 * unit;
+        float alpha = Clamp01(menu::g_OpenTime / 0.15f);
+        dl->AddRectFilled(ImVec2(L.x, top), ImVec2(L.x + L.w, top + h), pal::WithAlpha(bw::Panel, 0.9f * alpha));
+        dl->AddRect(ImVec2(L.x, top), ImVec2(L.x + L.w, top + h), bw::White, 0, 0, 2 * unit);
+        float ts = 22 * unit;
+        Text(dl, ts, ImVec2(L.x + L.pad, top + (headerH - ts) * 0.5f), bw::White, "DEATH PROBE");
+        dl->AddLine(ImVec2(L.x + L.pad * 0.5f, top + headerH - 1 * unit), ImVec2(L.x + L.w - L.pad * 0.5f, top + headerH - 1 * unit), bw::White, 1.5f * unit);
+
+        uintptr_t mainStart = exl::util::modules::GetTargetStart();
+        float y = top + headerH;
+        char buf[64];
+        for (int i = 0; i < probe::Count; i++, y += L.rowH) {
+            u64 n = g_ChromaProbe[i].count - g_ProbeBase[i];
+            u64 lr = g_ChromaProbe[i].lastLr;
+            snprintf(buf, sizeof(buf), "%llu  <%lx", (unsigned long long) n, (unsigned long) (lr ? lr - mainStart : 0));
+            DrawRow(dl, L, y, false, probe::Defs[i].name, buf);
+        }
+        DrawRow(dl, L, y, menu::g_Cursor == 0, "RESET COUNTS", nullptr);
+        Text(dl, 13 * unit, ImVec2(L.x + L.pad, top + h - 22 * unit), bw::Gray, "L RESET   L-STICK LEFT BACK");
+    }
+
     void DrawSearchPage(ImDrawList* dl, float unit) {
         int results = SearchResultsShown();
         Layout L{ 36 * unit, 560 * unit, unit, 32 * unit, 16 * unit, 17 * unit };
@@ -1215,6 +1304,7 @@ namespace chroma {
 
     void DrawMenu(ImDrawList* dl, float unit) {
         if (menu::g_Page == Page::Search) { DrawSearchPage(dl, unit); return; }
+        if (menu::g_Page == Page::Probe) { DrawProbePage(dl, unit); return; }
         bool colorPage = menu::g_Page == Page::Color;
         int count = colorPage ? ColorCount : MainCount;
         Layout L{ 36 * unit, 460 * unit, unit, 44 * unit, 18 * unit, 20 * unit };
@@ -1246,7 +1336,7 @@ namespace chroma {
         float y = top + headerH;
         if (!colorPage) {
             for (int i = 0; i < MainCount; i++, y += L.rowH) {
-                DrawRow(dl, L, y, menu::g_Cursor == i, MainItems[i], i <= 1 ? ">" : nullptr);
+                DrawRow(dl, L, y, menu::g_Cursor == i, MainItems[i], i <= 2 ? ">" : nullptr);
             }
         } else {
             TeamOverride& o = g_Teams[menu::g_Team];
@@ -1445,6 +1535,8 @@ extern "C" void exl_main(void* x0, void* x1) {
 
     chroma::paint::g_Orig = &PaintColorParamHook::CallOrig;
     PaintColorParamHook::InstallAtOffset(0x1346ba0);
+
+    chroma::probe::Install();
 
     using FullKeyFn  = int (*)(nn::hid::NpadFullKeyState*, int, const unsigned int&);
     using HandheldFn = int (*)(nn::hid::NpadHandheldState*, int, const unsigned int&);
