@@ -18,7 +18,8 @@
  *
  * NVN の nvnBootstrapLoader をフックして imgui-xeno に渡し、
  * ゲームの画面表示の直前に ImGui のメニューを重ね描きする。
- * 操作: L でメニューを開く。十字キー上下で選択、左右で値を変える、L で決定、左スティックを左で戻る/閉じる。
+ * 操作: L でメニューを開く。十字キー上下で選択、L で決定(設定の項目は右に調整パネルが出て、左右で値を変える)、
+ *       左スティックを左で戻る/閉じる。
  *
  * メニューは作り直し中: いまは「設定(フォント・メニューの大きさ・文字の大きさ)」だけ。
  * 見た目: 白基調・黒文字。フォントは Switch 本体のフォント + フリーフォント 10 種類
@@ -318,6 +319,9 @@ namespace chroma {
         int   g_Cursor   = 0;
         float g_OpenTime = 0.0f;
         bool  g_WasOpen  = false;
+        bool  g_Editing  = false;  /* 右の調整パネルを開いているか */
+        float g_PopTime  = 0.0f;   /* 調整パネルが出てからの時間(ぽんと出る演出用) */
+        float g_NoteTime = -1.0f;  /* 「元に戻しました」を出している時間 */
     }
 
     const char* const MainItems[]     = { "設定" };
@@ -325,14 +329,20 @@ namespace chroma {
     constexpr int MainCount     = sizeof(MainItems) / sizeof(MainItems[0]);
     constexpr int SettingsCount = sizeof(SettingsItems) / sizeof(SettingsItems[0]);
 
+    void StopEditing() {
+        menu::g_Editing = false;
+        if (settings::g_Dirty) settings::Save();
+    }
+
     void GoTo(Page p) {
-        if (menu::g_Page == Page::Settings && p != Page::Settings && settings::g_Dirty) settings::Save();
+        StopEditing();
         menu::g_Page = p;
         menu::g_Cursor = 0;
+        menu::g_NoteTime = -1.0f;
     }
 
     void Close() {
-        if (settings::g_Dirty) settings::Save();
+        StopEditing();
         CloseMenu();
     }
 
@@ -351,11 +361,25 @@ namespace chroma {
         if (n != v) { v = n; settings::g_Dirty = true; }
     }
 
-    void HandleInput() {
+    void HandleInput(float dt) {
+        bool canDecide = menu::g_OpenTime > 0.25f;  /* 開いたときの L を決定と間違えない */
+        if (menu::g_NoteTime >= 0.0f) { menu::g_NoteTime += dt; if (menu::g_NoteTime > 1.2f) menu::g_NoteTime = -1.0f; }
+
+        /* 調整パネルを開いている間: 左右で値を変える。L か 左スティック左 で閉じる */
+        if (menu::g_Editing) {
+            menu::g_PopTime += dt;
+            int dir = PressedRightR() ? 1 : (PressedLeftR() ? -1 : 0);
+            switch (menu::g_Cursor) {
+                case 0: if (dir) StepFont(dir); break;
+                case 1: if (dir) StepScale(settings::g_MenuScale, dir); break;
+                case 2: if (dir) StepScale(settings::g_TextScale, dir); break;
+            }
+            if ((canDecide && PressedDecide()) || PressedBack()) StopEditing();
+            return;
+        }
+
         int count = menu::g_Page == Page::Main ? MainCount : SettingsCount;
         if (menu::g_Cursor >= count) menu::g_Cursor = count - 1;
-        bool canDecide = menu::g_OpenTime > 0.25f;  /* 開いたときの L を決定と間違えない */
-
         if (PressedUp())   menu::g_Cursor = (menu::g_Cursor + count - 1) % count;
         if (PressedDown()) menu::g_Cursor = (menu::g_Cursor + 1) % count;
 
@@ -365,21 +389,16 @@ namespace chroma {
             return;
         }
 
-        int dir = PressedRightR() ? 1 : (PressedLeftR() ? -1 : 0);
-        switch (menu::g_Cursor) {
-            case 0: /* FONT */
-                if (dir) StepFont(dir);
-                else if (canDecide && PressedDecide()) StepFont(1);
-                break;
-            case 1: /* MENU SIZE */
-                if (dir) StepScale(settings::g_MenuScale, dir);
-                break;
-            case 2: /* TEXT SIZE */
-                if (dir) StepScale(settings::g_TextScale, dir);
-                break;
-            case 3: /* RESET */
-                if (canDecide && PressedDecide()) settings::Reset();
-                break;
+        if (canDecide && PressedDecide()) {
+            if (menu::g_Cursor <= 2) {          /* 調整パネルを出す */
+                menu::g_Editing = true;
+                menu::g_PopTime = 0.0f;
+                menu::g_NoteTime = -1.0f;
+            } else {                            /* 元に戻す */
+                settings::Reset();
+                settings::Save();
+                menu::g_NoteTime = 0.0f;
+            }
         }
         if (PressedBack()) GoTo(Page::Main);
     }
@@ -393,7 +412,7 @@ namespace chroma {
     };
 
     /* 1行分。選択中は薄いグレー + 左に黒い線 */
-    void DrawRow(ImDrawList* dl, const Layout& L, float y, bool selected, const char* label, const char* value) {
+    void DrawRow(ImDrawList* dl, const Layout& L, float y, bool selected, const char* label, const char* mark) {
         float y0 = y + 3 * L.unit, y1 = y + L.rowH - 3 * L.unit;
         if (selected) {
             dl->AddRectFilled(ImVec2(L.x + L.pad * 0.5f, y0), ImVec2(L.x + L.w - L.pad * 0.5f, y1), theme::Select, 6 * L.unit);
@@ -401,7 +420,7 @@ namespace chroma {
         }
         float ty = (y0 + y1) * 0.5f - L.fs * 0.5f;
         Text(dl, L.fs, ImVec2(L.x + L.pad + 4 * L.unit, ty), theme::Text, label);
-        if (value) Text(dl, L.fs, ImVec2(L.x + L.w - L.pad - TextW(L.fs, value), ty), selected ? theme::Text : theme::SubText, value);
+        if (mark) Text(dl, L.fs, ImVec2(L.x + L.w - L.pad - TextW(L.fs, mark), ty), selected ? theme::Text : theme::SubText, mark);
     }
 
     /* 白いパネル(うっすら影つき) */
@@ -412,64 +431,85 @@ namespace chroma {
         dl->AddRect(p0, p1, pal::WithAlpha(theme::Border, alpha), r, 0, 1.0f * unit);
     }
 
+    /* 選んだ項目の右に、ぽんと出る小さなパネル(値 + 操作の説明) */
+    void DrawPopout(ImDrawList* dl, float x, float rowY, float rowH, float unit, float text,
+                    const char* value, float valueW, const char* hint, float t) {
+        float fs = 20 * unit * text, hs = 12 * unit * text;
+        float pad = 14 * unit;
+        float w = fmaxf(valueW, TextW(hs, hint)) + pad * 2;
+        float h = fs + hs + 26 * unit;
+        float cy = rowY + rowH * 0.5f;
+
+        float s = EaseOutBack(Clamp01(t / 0.18f));      /* 左端から、ぽよんと広がる */
+        float a = Clamp01(t / 0.08f);
+        ImVec2 p0(x, cy - h * 0.5f * s), p1(x + w * s, cy + h * 0.5f * s);
+        DrawPanel(dl, p0, p1, unit, a);
+        if (s < 0.85f) return;
+
+        float vx = x + (w - TextW(fs, value)) * 0.5f;
+        Text(dl, fs, ImVec2(vx, cy - h * 0.5f + 9 * unit), theme::Text, value);
+        float hx = x + (w - TextW(hs, hint)) * 0.5f;
+        Text(dl, hs, ImVec2(hx, cy + h * 0.5f - hs - 8 * unit), theme::SubText, hint);
+    }
+
     void DrawMenu(ImDrawList* dl, float unit, float text) {
         bool settingsPage = menu::g_Page == Page::Settings;
         int count = settingsPage ? SettingsCount : MainCount;
         float fs = 20 * unit * text;
-        /* 文字を大きくしたときに行からはみ出さないよう、行の高さと幅も文字に合わせて広げる */
+        /* 文字を大きくしたときに行からはみ出さないよう、行の高さも文字に合わせて広げる */
         float rowH = (fs + 24 * unit) > 44 * unit ? (fs + 24 * unit) : 44 * unit;
-
         float ts = 24 * unit * text;
         float headerH = ts + 30 * unit;
-        float gs = 13 * unit * text;
 
-        /* 幅は中身に合わせて最小限にする(フォントを切り替えても幅が変わらないよう、いちばん長い候補で測る) */
-        float labelW = 0.0f, valueW = 0.0f;
-        char tmp[64];
-        if (!settingsPage) {
-            for (int i = 0; i < MainCount; i++) labelW = fmaxf(labelW, TextW(fs, MainItems[i]));
-            valueW = TextW(fs, ">");
-        } else {
-            for (int i = 0; i < SettingsCount; i++) labelW = fmaxf(labelW, TextW(fs, SettingsItems[i]));
-            for (int i = 0; i < fonts::Count; i++) {
-                snprintf(tmp, sizeof(tmp), "< %s >", fonts::Name(i));
-                valueW = fmaxf(valueW, TextW(fs, tmp));
-            }
-            valueW = fmaxf(valueW, TextW(fs, "< 200% >"));
-        }
+        /* 幅は項目名とタイトルが入るぶんだけ(値は右のパネルに出すので、ここには入れない) */
+        const char* const* items = settingsPage ? SettingsItems : MainItems;
+        const char* title = settingsPage ? "設定" : "CHROMA RUSH";
         float pad = 14 * unit;
-        float contentW = pad + 4 * unit + labelW + 24 * unit + valueW + pad;
-        contentW = fmaxf(contentW, pad * 2 + 4 * unit + TextW(ts, settingsPage ? "設定" : "CHROMA RUSH"));
-        contentW = fmaxf(contentW, pad * 2 + 4 * unit + TextW(gs, settingsPage ? "十字キー左右：変える　左スティック左：戻る" : "L：決定　左スティック左：閉じる"));
-        Layout L{ 24 * unit, contentW, unit, rowH, pad, fs };
-        float footerH = gs + 24 * unit;
-        float h = headerH + L.rowH * count + footerH;
+        float markW = settingsPage ? 0.0f : TextW(fs, ">") + 16 * unit;
+        float labelW = 0.0f;
+        for (int i = 0; i < count; i++) labelW = fmaxf(labelW, TextW(fs, items[i]));
+        float w = fmaxf(pad * 2 + 4 * unit + labelW + markW, pad * 2 + 4 * unit + TextW(ts, title));
+        Layout L{ 24 * unit, w, unit, rowH, pad, fs };
+        float h = headerH + L.rowH * count + 8 * unit;
         float top = 24 * unit;
 
         float alpha = Clamp01(menu::g_OpenTime / 0.15f);
         DrawPanel(dl, ImVec2(L.x, top), ImVec2(L.x + L.w, top + h), unit, alpha);
-
-        const char* title = settingsPage ? "設定" : "CHROMA RUSH";
         Text(dl, ts, ImVec2(L.x + L.pad + 4 * unit, top + (headerH - ts) * 0.5f), theme::Text, title);
         dl->AddLine(ImVec2(L.x + L.pad * 0.5f, top + headerH - 1 * unit), ImVec2(L.x + L.w - L.pad * 0.5f, top + headerH - 1 * unit), theme::Border, 1.0f * unit);
 
         float y = top + headerH;
-        char buf[64];
-        if (!settingsPage) {
-            for (int i = 0; i < MainCount; i++, y += L.rowH) DrawRow(dl, L, y, menu::g_Cursor == i, MainItems[i], ">");
-        } else {
-            snprintf(buf, sizeof(buf), "< %s >", fonts::Name(settings::g_Font));
-            DrawRow(dl, L, y, menu::g_Cursor == 0, SettingsItems[0], buf); y += L.rowH;
-            snprintf(buf, sizeof(buf), "< %d%% >", settings::g_MenuScale);
-            DrawRow(dl, L, y, menu::g_Cursor == 1, SettingsItems[1], buf); y += L.rowH;
-            snprintf(buf, sizeof(buf), "< %d%% >", settings::g_TextScale);
-            DrawRow(dl, L, y, menu::g_Cursor == 2, SettingsItems[2], buf); y += L.rowH;
-            DrawRow(dl, L, y, menu::g_Cursor == 3, SettingsItems[3], nullptr); y += L.rowH;
+        for (int i = 0; i < count; i++, y += L.rowH) {
+            DrawRow(dl, L, y, menu::g_Cursor == i, items[i], settingsPage ? nullptr : ">");
         }
 
-        dl->AddLine(ImVec2(L.x + L.pad * 0.5f, top + h - footerH), ImVec2(L.x + L.w - L.pad * 0.5f, top + h - footerH), theme::Border, 1.0f * unit);
-        const char* guide = settingsPage ? "十字キー左右：変える　左スティック左：戻る" : "L：決定　左スティック左：閉じる";
-        Text(dl, gs, ImVec2(L.x + L.pad + 4 * unit, top + h - footerH + (footerH - gs) * 0.5f), theme::SubText, guide);
+        if (!settingsPage) return;
+        float rowY = top + headerH + L.rowH * menu::g_Cursor;
+        float px = L.x + L.w + 8 * unit;
+
+        /* 元に戻したとき: 少しだけお知らせを出す */
+        if (menu::g_NoteTime >= 0.0f && menu::g_Cursor == 3) {
+            const char* note = "元に戻しました";
+            DrawPopout(dl, px, rowY, L.rowH, unit, text, note, TextW(fs, note), "", menu::g_NoteTime);
+            return;
+        }
+        if (!menu::g_Editing) return;
+
+        /* 調整パネル: 幅は候補のうちいちばん長いもので固定(切り替えても幅が揺れない) */
+        char buf[64], tmp[64];
+        float valueW = 0.0f;
+        if (menu::g_Cursor == 0) {
+            for (int i = 0; i < fonts::Count; i++) {
+                if (!fonts::Available(i)) continue;
+                snprintf(tmp, sizeof(tmp), "< %s >", fonts::Name(i));
+                valueW = fmaxf(valueW, TextW(fs, tmp));
+            }
+            snprintf(buf, sizeof(buf), "< %s >", fonts::Name(settings::g_Font));
+        } else {
+            valueW = TextW(fs, "< 200% >");
+            snprintf(buf, sizeof(buf), "< %d%% >", menu::g_Cursor == 1 ? settings::g_MenuScale : settings::g_TextScale);
+        }
+        DrawPopout(dl, px, rowY, L.rowH, unit, text, buf, valueW, "十字キー左右：変える　L：決定", menu::g_PopTime);
     }
 
     void OnPreInit() {
@@ -505,11 +545,12 @@ namespace chroma {
         if (!menu::g_WasOpen) {
             GoTo(Page::Main);
             menu::g_OpenTime = 0.0f;
+            menu::g_Editing = false;
             menu::g_WasOpen = true;
         }
         menu::g_OpenTime += dt;
 
-        HandleInput();
+        HandleInput(dt);
         if (IsMenuOpen()) DrawMenu(dl, unit, text);
     }
 
