@@ -9,6 +9,8 @@
 #include <imgui.h>
 #include <imgui_xeno.h>
 
+#include "recorder.hpp"
+
 /*
  * Chroma Rush
  *
@@ -1552,6 +1554,9 @@ extern "C" void exl_main(void* x0, void* x1) {
     PaintColorParamHook::InstallAtOffset(0x1346ba0);
 
     chroma::probe::Install();
+
+    /* 実機調査用の記録(ヒーローモード / サイドオーダー / 機内モード中だけ記録) */
+    chroma::recorder::Install();
 
     using FullKeyFn  = int (*)(nn::hid::NpadFullKeyState*, int, const unsigned int&);
     using HandheldFn = int (*)(nn::hid::NpadHandheldState*, int, const unsigned int&);

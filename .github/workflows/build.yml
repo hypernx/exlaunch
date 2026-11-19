@@ -53,7 +53,7 @@ jobs:
           path: "*.elf"
       # ビルド結果を artifacts ブランチにも置く(チャットから直接受け取れるように)
       - name: Publish to artifacts branch
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/chroma-recorder'
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -63,7 +63,9 @@ jobs:
           echo "${GITHUB_SHA}" > out/COMMIT
           cd out
           git init -q
-          git checkout -q -b artifacts
+          BR=artifacts
+          if [ "${GITHUB_REF_NAME}" != "main" ]; then BR="artifacts-${GITHUB_REF_NAME}"; fi
+          git checkout -q -b "$BR"
           git add .
           git -c user.name=ci -c user.email=ci@localhost commit -q -m "build ${GITHUB_SHA}"
-          git push -q -f "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" artifacts
+          git push -q -f "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$BR"
