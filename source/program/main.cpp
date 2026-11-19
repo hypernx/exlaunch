@@ -470,14 +470,13 @@ namespace chroma {
             DrawRow(dl, m, left, left + w0, rows0 + m.rowH * i, menu::g_Cursor[0] == i, menu::g_Level == 0, MainItems[i]);
         }
 
-        /* ---- 列1: 選んでいる項目の中身が、その行から右に伸びる ---- */
+        /* ---- 列1: 選んでいる項目の中身が右に伸びる(上端はメニューの上端にそろえる) ---- */
         if (menu::g_Cursor[0] != 0) return;  /* いまは「設定」だけ */
         float x1 = left + w0 - 1 * unit;
-        float rowTop0 = rows0 + m.rowH * menu::g_Cursor[0];
         float w1 = ListWidth(m, SettingsItems, SettingsCount);
         float h1 = m.rowH * SettingsCount + 6 * unit;
         float g1 = GrowAmount(menu::g_Grow[0]);
-        float y1top = rowTop0;
+        float y1top = top;  /* 右の列は画面のいちばん上(メニューの上端)からそろえて出す */
         ImVec2 a0(x1, y1top), a1(x1 + w1 * g1, y1top + h1);
         DrawPanel(dl, a0, a1, unit, alpha, ImDrawFlags_RoundCornersRight | ImDrawFlags_RoundCornersBottomLeft);
         dl->PushClipRect(a0, a1, true);
