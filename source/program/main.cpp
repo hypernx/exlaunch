@@ -412,30 +412,39 @@ namespace chroma {
         dl->AddRect(p0, p1, pal::WithAlpha(theme::Border, alpha), r, 0, 1.0f * unit);
     }
 
-    /* メニューを閉じているときの小さな表示 */
-    void DrawClosedTab(ImDrawList* dl, float unit, float text) {
-        const char* s = "CHROMA RUSH　L：メニュー";
-        float fs = 14 * unit * text;
-        ImVec2 p0(20 * unit, 16 * unit);
-        ImVec2 p1(p0.x + TextW(fs, s) + 20 * unit, p0.y + fs + 12 * unit);
-        dl->AddRectFilled(p0, p1, IM_COL32(255, 255, 255, 210), 6 * unit);
-        Text(dl, fs, ImVec2(p0.x + 10 * unit, p0.y + 6 * unit), theme::Text, s);
-    }
-
     void DrawMenu(ImDrawList* dl, float unit, float text) {
         bool settingsPage = menu::g_Page == Page::Settings;
         int count = settingsPage ? SettingsCount : MainCount;
         float fs = 20 * unit * text;
         /* 文字を大きくしたときに行からはみ出さないよう、行の高さと幅も文字に合わせて広げる */
         float rowH = (fs + 24 * unit) > 44 * unit ? (fs + 24 * unit) : 44 * unit;
-        Layout L{ 36 * unit, 500 * unit * (text > 1.0f ? text : 1.0f), unit, rowH, 18 * unit, fs };
 
         float ts = 24 * unit * text;
         float headerH = ts + 30 * unit;
         float gs = 13 * unit * text;
+
+        /* 幅は中身に合わせて最小限にする(フォントを切り替えても幅が変わらないよう、いちばん長い候補で測る) */
+        float labelW = 0.0f, valueW = 0.0f;
+        char tmp[64];
+        if (!settingsPage) {
+            for (int i = 0; i < MainCount; i++) labelW = fmaxf(labelW, TextW(fs, MainItems[i]));
+            valueW = TextW(fs, ">");
+        } else {
+            for (int i = 0; i < SettingsCount; i++) labelW = fmaxf(labelW, TextW(fs, SettingsItems[i]));
+            for (int i = 0; i < fonts::Count; i++) {
+                snprintf(tmp, sizeof(tmp), "< %s >", fonts::Name(i));
+                valueW = fmaxf(valueW, TextW(fs, tmp));
+            }
+            valueW = fmaxf(valueW, TextW(fs, "< 200% >"));
+        }
+        float pad = 14 * unit;
+        float contentW = pad + 4 * unit + labelW + 24 * unit + valueW + pad;
+        contentW = fmaxf(contentW, pad * 2 + 4 * unit + TextW(ts, settingsPage ? "設定" : "CHROMA RUSH"));
+        contentW = fmaxf(contentW, pad * 2 + 4 * unit + TextW(gs, settingsPage ? "十字キー左右：変える　左スティック左：戻る" : "L：決定　左スティック左：閉じる"));
+        Layout L{ 24 * unit, contentW, unit, rowH, pad, fs };
         float footerH = gs + 24 * unit;
         float h = headerH + L.rowH * count + footerH;
-        float top = 30 * unit;
+        float top = 24 * unit;
 
         float alpha = Clamp01(menu::g_OpenTime / 0.15f);
         DrawPanel(dl, ImVec2(L.x, top), ImVec2(L.x + L.w, top + h), unit, alpha);
@@ -490,8 +499,7 @@ namespace chroma {
         if (!IsMenuOpen()) {
             if (menu::g_WasOpen && settings::g_Dirty) settings::Save();
             menu::g_WasOpen = false;
-            DrawClosedTab(dl, unit, text);
-            return;
+            return;  /* 閉じている間は何も表示しない */
         }
 
         if (!menu::g_WasOpen) {
