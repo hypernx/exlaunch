@@ -1262,8 +1262,22 @@ namespace chroma {
         Text(dl, ts, ImVec2(L.x + L.pad, top + (headerH - ts) * 0.5f), bw::White, "VALUE SEARCH");
         dl->AddLine(ImVec2(L.x + L.pad * 0.5f, top + headerH - 1 * unit), ImVec2(L.x + L.w - L.pad * 0.5f, top + headerH - 1 * unit), bw::White, 1.5f * unit);
 
-        float y = top + headerH;
+        /* 見出しの右側に、大きく件数(状態)を出す */
         char buf[96];
+        {
+            if (search::Busy()) snprintf(buf, sizeof(buf), "SEARCHING %d%%", (int) (search::Progress() * 100.0f));
+            else if (search::g_TooMany) snprintf(buf, sizeof(buf), "TOO MANY");
+            else if (!search::g_HasScan) snprintf(buf, sizeof(buf), "FOUND: -");
+            else snprintf(buf, sizeof(buf), "FOUND: %d", search::g_Count);
+            float fs = 22 * unit;
+            float fw = TextW(fs, buf);
+            float bx1 = L.x + L.w - L.pad * 0.5f, bx0 = bx1 - fw - 20 * unit;
+            float by0 = top + 8 * unit, by1 = top + headerH - 8 * unit;
+            dl->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1), bw::White);
+            Text(dl, fs, ImVec2(bx0 + 10 * unit, (by0 + by1) * 0.5f - fs * 0.5f), bw::Black, buf);
+        }
+
+        float y = top + headerH;
         for (int i = 0; i < SearchItemCount; i++, y += L.rowH) {
             const char* val = nullptr;
             if (i == 0) { snprintf(buf, sizeof(buf), "< %d >", search::g_Value); val = buf; }
