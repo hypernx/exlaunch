@@ -27,6 +27,14 @@ jobs:
             -DCMAKE_BUILD_TYPE=RelWithDebInfo
           cmake --build libs/imgui-xeno/build -j"$(nproc)"
           ls -l libs/imgui-xeno/build/libimgui_xeno.a
+      # メニュー用のフリーフォント(Google Fonts)を取ってきて、メニューで使う文字だけに絞って埋め込む
+      - name: Make menu fonts
+        run: |
+          pip3 install --break-system-packages fonttools || pip3 install fonttools
+          git clone -q --depth 1 --filter=blob:none --sparse https://github.com/google/fonts.git /tmp/gfonts
+          PATHS=$(grep -v '^#' tools/fonts.txt | awk -F'|' 'NF>=2 {gsub(/ /,"",$2); sub(/\/[^\/]*$/,"",$2); print $2}' | sort -u)
+          git -C /tmp/gfonts sparse-checkout set $PATHS
+          python3 tools/make_fonts.py /tmp/gfonts .
       - name: Build plugin
         run: make -j"$(nproc)"
       # モジュール先頭(+0:分岐, +4:MOD0, +8:SDKバージョン)の確認用

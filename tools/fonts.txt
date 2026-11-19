@@ -1,0 +1,12 @@
+# メニューに入れるフリーフォント(Google Fonts / SIL Open Font License)
+# 書式: 表示名 | google/fonts リポジトリ内のパス | 可変フォントの太さ(なければ -)
+ゴシック         | ofl/notosansjp/NotoSansJP[wght].ttf            | 500
+すっきりゴシック | ofl/zenkakugothicnew/ZenKakuGothicNew-Medium.ttf | -
+丸ゴシック       | ofl/mplusrounded1c/MPLUSRounded1c-Medium.ttf   | -
+やさしい丸       | ofl/zenmarugothic/ZenMaruGothic-Medium.ttf     | -
+まる明朝         | ofl/kiwimaru/KiwiMaru-Medium.ttf               | -
+ドット           | ofl/dotgothic16/DotGothic16-Regular.ttf        | -
+ポップ           | ofl/rocknrollone/RocknRollOne-Regular.ttf      | -
+極太             | ofl/delagothicone/DelaGothicOne-Regular.ttf    | -
+インク風         | ofl/reggaeone/ReggaeOne-Regular.ttf            | -
+手書き           | ofl/hachimarupop/HachiMaruPop-Regular.ttf      | -

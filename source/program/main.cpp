@@ -20,7 +20,9 @@
  * ゲームの画面表示の直前に ImGui のメニューを重ね描きする。
  * 操作: L でメニューを開く。十字キー上下で選択、左右で値を変える、L で決定、左スティックを左で戻る/閉じる。
  *
- * メニューは作り直し中: いまは「SETTINGS(フォント・メニューの大きさ・文字の大きさ)」だけ。
+ * メニューは作り直し中: いまは「設定(フォント・メニューの大きさ・文字の大きさ)」だけ。
+ * 見た目: 白基調・黒文字。フォントは Switch 本体のフォント + フリーフォント 10 種類
+ * (tools/fonts.txt。ビルド時にメニューで使う文字だけを取り出して埋め込む)。
  * 設定は sd:/ChromaRush/settings.txt に保存される。
  */
 
@@ -61,11 +63,15 @@ namespace chroma {
         }
     }
 
-    namespace bw {
-        constexpr ImU32 Black = IM_COL32(0, 0, 0, 255);
-        constexpr ImU32 White = IM_COL32(255, 255, 255, 255);
-        constexpr ImU32 Gray  = IM_COL32(150, 150, 150, 255);
-        constexpr ImU32 Panel = IM_COL32(8, 8, 8, 230);
+    /* 白基調・黒文字 */
+    namespace theme {
+        constexpr ImU32 Panel    = IM_COL32(255, 255, 255, 245);  /* メニューの地 */
+        constexpr ImU32 Shadow   = IM_COL32(0, 0, 0, 60);         /* うっすら影 */
+        constexpr ImU32 Border   = IM_COL32(210, 210, 210, 255);  /* 枠・区切り線 */
+        constexpr ImU32 Text     = IM_COL32(20, 20, 20, 255);     /* 文字 */
+        constexpr ImU32 SubText  = IM_COL32(110, 110, 110, 255);  /* 値・説明 */
+        constexpr ImU32 Select   = IM_COL32(235, 235, 235, 255);  /* 選択中の行 */
+        constexpr ImU32 Accent   = IM_COL32(20, 20, 20, 255);     /* 選択中の行の左の線 */
     }
 
     /* イージング: ぽよんと跳ねる */
@@ -81,12 +87,25 @@ namespace chroma {
     /* ------------------------------------------------------------------ */
 
     namespace fonts {
-        constexpr float BakeSize = 36.0f;  /* 大きめに作って縮めて使う(拡大してもぼやけにくい) */
+        struct EmbeddedFont { const char* name; const unsigned char* data; size_t size; };
+#include "generated/fonts_data.inc"
 
-        enum Id { JetBrains = 0, SwitchStd, Proggy, Count };
-        const char* const Names[Count] = { "JETBRAINS MONO", "SWITCH", "PROGGY (PIXEL)" };
+        constexpr int EmbeddedCount = sizeof(kEmbeddedFonts) / sizeof(kEmbeddedFonts[0]);
+        constexpr int Count = 1 + EmbeddedCount;  /* 0 = Switch 本体のフォント */
+        constexpr float BakeSize = 28.0f;         /* 少し大きめに作って縮めて使う */
 
         ImFont* g_Fonts[Count] = {};
+
+        const char* Name(int id) { return id == 0 ? "Switch 本体" : kEmbeddedFonts[id - 1].name; }
+
+        ImFontConfig MakeConfig() {
+            ImFontConfig cfg;
+            cfg.FontDataOwnedByAtlas = false;  /* 元のデータは ImGui に解放させない */
+            cfg.OversampleH = 1;
+            cfg.OversampleV = 1;
+            cfg.PixelSnapH = true;
+            return cfg;
+        }
 
         /* Switch 本体の共有フォント(読み込みが終わるまで少し待つ) */
         ImFont* AddShared(nn::pl::SharedFontType type) {
@@ -97,28 +116,30 @@ namespace chroma {
             const void* data = nn::pl::GetSharedFontAddress(type);
             size_t size = nn::pl::GetSharedFontSize(type);
             if (data == nullptr || size == 0) return nullptr;
-            ImFontConfig cfg;
-            cfg.FontDataOwnedByAtlas = false;  /* 本体のメモリなので ImGui に解放させない */
-            cfg.OversampleH = 2;
-            return ImGui::GetIO().Fonts->AddFontFromMemoryTTF(const_cast<void*>(data), (int) size, BakeSize, &cfg);
+            ImFontConfig cfg = MakeConfig();
+            return ImGui::GetIO().Fonts->AddFontFromMemoryTTF(const_cast<void*>(data), (int) size, BakeSize, &cfg, kGlyphRanges);
         }
 
-        /* imgui-xeno が既定フォント(JetBrains Mono)を足す前に呼ばれる */
+        /* imgui-xeno が既定フォントを足す前に呼ばれる。メニューで使う文字だけを焼き込む */
         void OnPreInit() {
             ImGuiIO& io = ImGui::GetIO();
-            g_Fonts[SwitchStd]    = AddShared(nn::pl::SharedFontType_Standard);
-            ImFontConfig proggy;
-            proggy.SizePixels = 26.0f;
-            g_Fonts[Proggy] = io.Fonts->AddFontDefault(&proggy);
+            g_Fonts[0] = AddShared(nn::pl::SharedFontType_Standard);
+            for (int i = 0; i < EmbeddedCount; i++) {
+                ImFontConfig cfg = MakeConfig();
+                g_Fonts[1 + i] = io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(kEmbeddedFonts[i].data),
+                                                                (int) kEmbeddedFonts[i].size, BakeSize, &cfg, kGlyphRanges);
+            }
         }
 
-        /* 既定フォントは最後に足されるので、初期化のあとに拾う */
-        void OnPostInit() {
-            ImGuiIO& io = ImGui::GetIO();
-            if (io.Fonts->Fonts.Size > 0) g_Fonts[JetBrains] = io.Fonts->Fonts[io.Fonts->Fonts.Size - 1];
-        }
+        void OnPostInit() {}
 
         bool Available(int id) { return id >= 0 && id < Count && g_Fonts[id] != nullptr; }
+
+        /* 最初に使えるフォント(Switch 本体 → 埋め込みの順) */
+        int First() {
+            for (int i = 0; i < Count; i++) if (Available(i)) return i;
+            return 0;
+        }
     }
 
     /* ------------------------------------------------------------------ */
@@ -129,7 +150,7 @@ namespace chroma {
         constexpr const char* Path = "sd:/ChromaRush/settings.txt";
         constexpr int ScaleMin = 50, ScaleMax = 200, ScaleStep = 5;
 
-        int  g_Font      = fonts::JetBrains;
+        int  g_Font      = 0;
         int  g_MenuScale = 100;  /* % */
         int  g_TextScale = 100;  /* % */
         bool g_Loaded    = false;
@@ -139,6 +160,7 @@ namespace chroma {
 
         void Load() {
             g_Loaded = true;
+            g_Font = fonts::First();
             if (!storage::EnsureSdMounted()) return;
             nn::fs::FileHandle h;
             if (R_FAILED(nn::fs::OpenFile(&h, Path, nn::fs::OpenMode_Read))) return;
@@ -177,7 +199,7 @@ namespace chroma {
         }
 
         void Reset() {
-            g_Font = fonts::JetBrains;
+            g_Font = fonts::First();
             g_MenuScale = 100;
             g_TextScale = 100;
             g_Dirty = true;
@@ -231,32 +253,33 @@ namespace chroma {
             float pop = EaseOutBack(t / 0.4f);
             ImVec2 c(ds.x * 0.5f, ds.y * 0.5f);
             ImVec2 p0(c.x - cw * 0.5f * pop, c.y - ch * 0.5f * pop), p1(c.x + cw * 0.5f * pop, c.y + ch * 0.5f * pop);
-            dl->AddRectFilled(p0, p1, pal::WithAlpha(IM_COL32(8, 8, 8, 255), 0.92f * fade));
-            dl->AddRect(p0, p1, pal::WithAlpha(pal::White, fade), 0, 0, 2 * unit);
+            dl->AddRectFilled(ImVec2(p0.x + 4 * unit, p0.y + 4 * unit), ImVec2(p1.x + 4 * unit, p1.y + 4 * unit), pal::WithAlpha(theme::Shadow, fade));
+            dl->AddRectFilled(p0, p1, pal::WithAlpha(theme::Panel, fade));
+            dl->AddRect(p0, p1, pal::WithAlpha(theme::Border, fade), 0, 0, 1.5f * unit);
             if (pop < 0.9f) return true;
 
             {
                 const char* logo = "CHROMA RUSH";
                 float ts = 30 * unit;
                 float tw = TextW(ts, logo);
-                Text(dl, ts, ImVec2(c.x - tw * 0.5f, c.y - 22 * unit - ts * 0.5f), pal::WithAlpha(pal::White, fade), logo);
+                Text(dl, ts, ImVec2(c.x - tw * 0.5f, c.y - 22 * unit - ts * 0.5f), pal::WithAlpha(theme::Text, fade), logo);
             }
 
             float bw_ = 240 * unit, bh = 10 * unit;
             ImVec2 b0(c.x - bw_ * 0.5f, c.y + 12 * unit), b1(c.x + bw_ * 0.5f, b0.y + bh);
             float prog = Clamp01(t / (Duration - 0.2f));
             prog = 1.0f - (1.0f - prog) * (1.0f - prog);
-            dl->AddRect(b0, b1, pal::WithAlpha(pal::White, fade), 0, 0, 1.5f * unit);
+            dl->AddRect(b0, b1, pal::WithAlpha(theme::Text, fade), 0, 0, 1.5f * unit);
             if (prog > 0.01f) {
                 dl->AddRectFilled(ImVec2(b0.x + 3 * unit, b0.y + 3 * unit), ImVec2(b0.x + 3 * unit + (bw_ - 6 * unit) * prog, b1.y - 3 * unit),
-                                  pal::WithAlpha(pal::White, fade));
+                                  pal::WithAlpha(theme::Text, fade));
             }
 
-            char label[24];
-            snprintf(label, sizeof(label), "LOADING %d%%", (int) (prog * 100.0f));
+            char label[40];
+            snprintf(label, sizeof(label), "読み込み中 %d%%", (int) (prog * 100.0f));
             float ls = 14 * unit;
             float lw = TextW(ls, label);
-            Text(dl, ls, ImVec2(c.x - lw * 0.5f, b1.y + 8 * unit), pal::WithAlpha(IM_COL32(170, 170, 170, 255), fade), label);
+            Text(dl, ls, ImVec2(c.x - lw * 0.5f, b1.y + 8 * unit), pal::WithAlpha(theme::SubText, fade), label);
 
             return true;
         }
@@ -297,8 +320,8 @@ namespace chroma {
         bool  g_WasOpen  = false;
     }
 
-    const char* const MainItems[]     = { "SETTINGS" };
-    const char* const SettingsItems[] = { "FONT", "MENU SIZE", "TEXT SIZE", "RESET" };
+    const char* const MainItems[]     = { "設定" };
+    const char* const SettingsItems[] = { "フォント", "メニューの大きさ", "文字の大きさ", "元に戻す" };
     constexpr int MainCount     = sizeof(MainItems) / sizeof(MainItems[0]);
     constexpr int SettingsCount = sizeof(SettingsItems) / sizeof(SettingsItems[0]);
 
@@ -369,24 +392,34 @@ namespace chroma {
         float x, w, unit, rowH, pad, fs;
     };
 
-    /* 1行分。選択中は白地に黒文字 */
+    /* 1行分。選択中は薄いグレー + 左に黒い線 */
     void DrawRow(ImDrawList* dl, const Layout& L, float y, bool selected, const char* label, const char* value) {
         float y0 = y + 3 * L.unit, y1 = y + L.rowH - 3 * L.unit;
-        if (selected) dl->AddRectFilled(ImVec2(L.x + L.pad * 0.5f, y0), ImVec2(L.x + L.w - L.pad * 0.5f, y1), bw::White);
-        ImU32 col = selected ? bw::Black : bw::White;
+        if (selected) {
+            dl->AddRectFilled(ImVec2(L.x + L.pad * 0.5f, y0), ImVec2(L.x + L.w - L.pad * 0.5f, y1), theme::Select, 6 * L.unit);
+            dl->AddRectFilled(ImVec2(L.x + L.pad * 0.5f, y0 + 6 * L.unit), ImVec2(L.x + L.pad * 0.5f + 4 * L.unit, y1 - 6 * L.unit), theme::Accent, 2 * L.unit);
+        }
         float ty = (y0 + y1) * 0.5f - L.fs * 0.5f;
-        Text(dl, L.fs, ImVec2(L.x + L.pad, ty), col, label);
-        if (value) Text(dl, L.fs, ImVec2(L.x + L.w - L.pad - TextW(L.fs, value), ty), selected ? bw::Black : bw::Gray, value);
+        Text(dl, L.fs, ImVec2(L.x + L.pad + 4 * L.unit, ty), theme::Text, label);
+        if (value) Text(dl, L.fs, ImVec2(L.x + L.w - L.pad - TextW(L.fs, value), ty), selected ? theme::Text : theme::SubText, value);
+    }
+
+    /* 白いパネル(うっすら影つき) */
+    void DrawPanel(ImDrawList* dl, ImVec2 p0, ImVec2 p1, float unit, float alpha) {
+        float r = 10 * unit;
+        dl->AddRectFilled(ImVec2(p0.x + 4 * unit, p0.y + 5 * unit), ImVec2(p1.x + 4 * unit, p1.y + 5 * unit), pal::WithAlpha(theme::Shadow, alpha), r);
+        dl->AddRectFilled(p0, p1, pal::WithAlpha(theme::Panel, alpha), r);
+        dl->AddRect(p0, p1, pal::WithAlpha(theme::Border, alpha), r, 0, 1.0f * unit);
     }
 
     /* メニューを閉じているときの小さな表示 */
     void DrawClosedTab(ImDrawList* dl, float unit, float text) {
-        const char* s = "CHROMA RUSH   L : MENU";
+        const char* s = "CHROMA RUSH　L：メニュー";
         float fs = 14 * unit * text;
         ImVec2 p0(20 * unit, 16 * unit);
         ImVec2 p1(p0.x + TextW(fs, s) + 20 * unit, p0.y + fs + 12 * unit);
-        dl->AddRectFilled(p0, p1, IM_COL32(0, 0, 0, 160));
-        Text(dl, fs, ImVec2(p0.x + 10 * unit, p0.y + 6 * unit), IM_COL32(255, 255, 255, 200), s);
+        dl->AddRectFilled(p0, p1, IM_COL32(255, 255, 255, 210), 6 * unit);
+        Text(dl, fs, ImVec2(p0.x + 10 * unit, p0.y + 6 * unit), theme::Text, s);
     }
 
     void DrawMenu(ImDrawList* dl, float unit, float text) {
@@ -395,29 +428,28 @@ namespace chroma {
         float fs = 20 * unit * text;
         /* 文字を大きくしたときに行からはみ出さないよう、行の高さと幅も文字に合わせて広げる */
         float rowH = (fs + 24 * unit) > 44 * unit ? (fs + 24 * unit) : 44 * unit;
-        Layout L{ 36 * unit, 460 * unit * (text > 1.0f ? text : 1.0f), unit, rowH, 18 * unit, fs };
+        Layout L{ 36 * unit, 500 * unit * (text > 1.0f ? text : 1.0f), unit, rowH, 18 * unit, fs };
 
-        float ts = 26 * unit * text;
-        float headerH = ts + 28 * unit;
+        float ts = 24 * unit * text;
+        float headerH = ts + 30 * unit;
         float gs = 13 * unit * text;
-        float footerH = gs + 21 * unit;
+        float footerH = gs + 24 * unit;
         float h = headerH + L.rowH * count + footerH;
         float top = 30 * unit;
 
         float alpha = Clamp01(menu::g_OpenTime / 0.15f);
-        dl->AddRectFilled(ImVec2(L.x, top), ImVec2(L.x + L.w, top + h), pal::WithAlpha(bw::Panel, 0.9f * alpha));
-        dl->AddRect(ImVec2(L.x, top), ImVec2(L.x + L.w, top + h), bw::White, 0, 0, 2 * unit);
+        DrawPanel(dl, ImVec2(L.x, top), ImVec2(L.x + L.w, top + h), unit, alpha);
 
-        const char* title = settingsPage ? "SETTINGS" : "CHROMA RUSH";
-        Text(dl, ts, ImVec2(L.x + L.pad, top + (headerH - ts) * 0.5f), bw::White, title);
-        dl->AddLine(ImVec2(L.x + L.pad * 0.5f, top + headerH - 1 * unit), ImVec2(L.x + L.w - L.pad * 0.5f, top + headerH - 1 * unit), bw::White, 1.5f * unit);
+        const char* title = settingsPage ? "設定" : "CHROMA RUSH";
+        Text(dl, ts, ImVec2(L.x + L.pad + 4 * unit, top + (headerH - ts) * 0.5f), theme::Text, title);
+        dl->AddLine(ImVec2(L.x + L.pad * 0.5f, top + headerH - 1 * unit), ImVec2(L.x + L.w - L.pad * 0.5f, top + headerH - 1 * unit), theme::Border, 1.0f * unit);
 
         float y = top + headerH;
-        char buf[48];
+        char buf[64];
         if (!settingsPage) {
             for (int i = 0; i < MainCount; i++, y += L.rowH) DrawRow(dl, L, y, menu::g_Cursor == i, MainItems[i], ">");
         } else {
-            snprintf(buf, sizeof(buf), "< %s >", fonts::Names[settings::g_Font]);
+            snprintf(buf, sizeof(buf), "< %s >", fonts::Name(settings::g_Font));
             DrawRow(dl, L, y, menu::g_Cursor == 0, SettingsItems[0], buf); y += L.rowH;
             snprintf(buf, sizeof(buf), "< %d%% >", settings::g_MenuScale);
             DrawRow(dl, L, y, menu::g_Cursor == 1, SettingsItems[1], buf); y += L.rowH;
@@ -426,8 +458,9 @@ namespace chroma {
             DrawRow(dl, L, y, menu::g_Cursor == 3, SettingsItems[3], nullptr); y += L.rowH;
         }
 
-        const char* guide = settingsPage ? "D-PAD LEFT/RIGHT CHANGE   L-STICK LEFT BACK" : "L SELECT   L-STICK LEFT CLOSE";
-        Text(dl, gs, ImVec2(L.x + L.pad, top + h - footerH + 8 * unit), bw::Gray, guide);
+        dl->AddLine(ImVec2(L.x + L.pad * 0.5f, top + h - footerH), ImVec2(L.x + L.w - L.pad * 0.5f, top + h - footerH), theme::Border, 1.0f * unit);
+        const char* guide = settingsPage ? "十字キー左右：変える　左スティック左：戻る" : "L：決定　左スティック左：閉じる";
+        Text(dl, gs, ImVec2(L.x + L.pad + 4 * unit, top + h - footerH + (footerH - gs) * 0.5f), theme::SubText, guide);
     }
 
     void OnPreInit() {
