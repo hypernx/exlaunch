@@ -4,809 +4,54 @@
 #include <cmath>
 #include <cstdio>
 #include <cfloat>
+#include <cstdlib>
 #include <cstring>
 
 #include <imgui.h>
 #include <imgui_xeno.h>
 
 #include "recorder.hpp"
+#include "storage.hpp"
 
 /*
  * Chroma Rush
  *
  * NVN の nvnBootstrapLoader をフックして imgui-xeno に渡し、
  * ゲームの画面表示の直前に ImGui のメニューを重ね描きする。
- * 操作: 左右のスティックを同時に押し込む (L3 + R3) と、コントローラーでメニューを操作できる。
+ * 操作: L でメニューを開く。十字キー上下で選択、左右で値を変える、L で決定、左スティックを左で戻る/閉じる。
+ *
+ * メニューは作り直し中: いまは「SETTINGS(フォント・メニューの大きさ・文字の大きさ)」だけ。
+ * 設定は sd:/ChromaRush/settings.txt に保存される。
  */
 
-/* ------------------------------------------------------------------ */
-/*  調査用: 候補の処理が呼ばれた回数と、呼び出し元を数える              */
-/*  (レジスタをほぼ触らない小さな入口を通して、元の処理へそのまま進む)  */
-/* ------------------------------------------------------------------ */
-
-struct ProbeSlot { u64 count; u64 lastLr; u64 tramp; u64 pad; };
-extern "C" ProbeSlot g_ChromaProbe[8];
-ProbeSlot g_ChromaProbe[8] = {};
-
-#define CHROMA_PROBE_STUB(N)                                              \
-    asm(".text\n.global chroma_probe_stub_" #N "\n"                     \
-        ".type chroma_probe_stub_" #N ", %function\n"                     \
-        "chroma_probe_stub_" #N ":\n"                                    \
-        "  adrp x16, g_ChromaProbe\n"                                    \
-        "  add  x16, x16, :lo12:g_ChromaProbe\n"                         \
-        "  add  x16, x16, #(" #N " * 32)\n"                              \
-        "  ldr  x17, [x16]\n"                                            \
-        "  add  x17, x17, #1\n"                                          \
-        "  str  x17, [x16]\n"                                            \
-        "  str  x30, [x16, #8]\n"                                        \
-        "  ldr  x17, [x16, #16]\n"                                       \
-        "  br   x17\n");                                                 \
-    extern "C" void chroma_probe_stub_##N();
-
-CHROMA_PROBE_STUB(0)
-CHROMA_PROBE_STUB(1)
-CHROMA_PROBE_STUB(2)
-CHROMA_PROBE_STUB(3)
-CHROMA_PROBE_STUB(4)
-CHROMA_PROBE_STUB(5)
-
-namespace chroma::probe {
-    struct Def { const char* name; uintptr_t offset; void (*stub)(); };
-    const Def Defs[] = {
-        { "A 284ced0 STATE",     0x284ced0, &chroma_probe_stub_0 },
-        { "B 293cfa8 FALL FX",   0x293cfa8, &chroma_probe_stub_1 },
-        { "C 28b9e18 FALL",      0x28b9e18, &chroma_probe_stub_2 },
-        { "D 2d845e0 REASON",    0x2d845e0, &chroma_probe_stub_3 },
-        { "E 34ac40c REASON",    0x34ac40c, &chroma_probe_stub_4 },
-        { "F 1e265a0 DETAIL",    0x1e265a0, &chroma_probe_stub_5 },
+namespace nn::pl {
+    enum SharedFontType {
+        SharedFontType_Standard = 0,
+        SharedFontType_ChineseSimple = 1,
+        SharedFontType_ChineseSimpleExtension = 2,
+        SharedFontType_ChineseTraditional = 3,
+        SharedFontType_Korean = 4,
+        SharedFontType_NintendoExtension = 5,
     };
-    constexpr int Count = sizeof(Defs) / sizeof(Defs[0]);
-
-    /* 回数を 0 に戻す(表示は「今の回数 - リセット時の回数」) */
-    u64 g_Base[8] = {};
-    void Reset() { for (int i = 0; i < 8; i++) g_Base[i] = g_ChromaProbe[i].count; }
-
-    void Install() {
-        for (int i = 0; i < Count; i++) {
-            uintptr_t target = exl::util::modules::GetTargetOffset(Defs[i].offset);
-            uintptr_t tramp = exl::hook::arch::Hook(target, reinterpret_cast<uintptr_t>(Defs[i].stub), true);
-            g_ChromaProbe[i].tramp = tramp;
-        }
-    }
+    enum SharedFontLoadState {
+        SharedFontLoadState_Loading = 0,
+        SharedFontLoadState_Loaded = 1,
+    };
+    SharedFontLoadState GetSharedFontLoadState(SharedFontType type);
+    const void* GetSharedFontAddress(SharedFontType type);
+    size_t GetSharedFontSize(SharedFontType type);
 }
 
 namespace chroma {
 
     float Clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
 
-    /*
-     * チームカラー表 (main 1.0 系 BuildID 28c4287a 専用のオフセット)
-     *
-     *   *(main + 0x6056160)            = チームカラー管理オブジェクト
-     *   obj + 0x2b8 + team * 0x12c     = チームごとの色ブロック
-     *   block + kind * 0x10            = sead::Color4f (kind は 0..16 の色バリエーション)
-     *
-     * 根拠: シェーダーの my_team_color 系パラメータを設定する処理 (0x1344b00) が、
-     *       色の取得関数 (0x1345e58) を通してこの表を読んでいる。
-     */
-    namespace teamcolor {
-        constexpr uintptr_t InstanceOffset = 0x6056160;
-        constexpr uintptr_t TableOffset    = 0x2b8;
-        constexpr size_t    TeamStride     = 0x12c;
-        constexpr int       KindCount      = 17;
-        constexpr int       TeamCount      = 2; /* 0 = Alpha, 1 = Bravo */
-
-        struct Color4f { float r, g, b, a; };
-
-        Color4f* GetTeamBlock(int team) {
-            uintptr_t instance = *reinterpret_cast<uintptr_t*>(exl::util::modules::GetTargetOffset(InstanceOffset));
-            if (instance == 0) return nullptr;
-            return reinterpret_cast<Color4f*>(instance + TableOffset + team * TeamStride);
-        }
-    }
-
-    struct TeamOverride {
-        const char* name;
-        bool  enabled  = false;
-        float color[3] = { 1.0f, 1.0f, 1.0f };
-    };
-
-    TeamOverride g_Teams[teamcolor::TeamCount] = {
-        { "Alpha", false, { 1.00f, 0.35f, 0.00f } },
-        { "Bravo", false, { 0.10f, 0.40f, 1.00f } },
-    };
-
-    /*
-     * ゲームの「チームの色をセットする関数」(0x13cb40c)。
-     *   void Set(Color4f* block, const Color4f* baseColor, u64 a, u64 b, float f)
-     * 基本色(sRGB)から 17 種類の色バリエーションを計算して block に書き込む。
-     * 表は 8 ブロック(4 チーム × 2 セット)ある。
-     */
-    using SetBlockFn = void (*)(teamcolor::Color4f*, const teamcolor::Color4f*, u64, u64, float);
-    SetBlockFn g_OrigSetBlock = nullptr;
-
-    constexpr int SetCount = 2;   /* 表のセット数 */
-    constexpr int SetTeams = 4;   /* 1セットあたりのチーム数 */
-
-    /* ゲームが最後にセットしたときの引数(色を作り直すために使う) */
-    struct BlockState {
-        bool  valid = false;
-        teamcolor::Color4f original{};  /* ゲーム本来の基本色 */
-        u64   a = 0, b = 0;
-        float f = 0.0f;
-    };
-    BlockState g_Blocks[teamcolor::TeamCount][SetCount];
-
-    teamcolor::Color4f* GetBlock(int team, int set) {
-        teamcolor::Color4f* base = teamcolor::GetTeamBlock(0);
-        if (base == nullptr) return nullptr;
-        auto* p = reinterpret_cast<u8*>(base) + (team + set * SetTeams) * teamcolor::TeamStride;
-        return reinterpret_cast<teamcolor::Color4f*>(p);
-    }
-
-    /* ブロック内の基本色(+0x110) */
-    teamcolor::Color4f* GetBaseColor(int team) {
-        teamcolor::Color4f* block = GetBlock(team, 0);
-        return block ? reinterpret_cast<teamcolor::Color4f*>(reinterpret_cast<u8*>(block) + 0x110) : nullptr;
-    }
-
-    /*
-     * 「いまゲームの中にコピーされている色」の控え。
-     * キャラや地面は、試合の開始時に表から色を写して使い続けるので、
-     * 表を書き換えただけでは変わらない。そこで、この控えと同じ値を
-     * ゲームのメモリから探して、新しい色に置き換える(メモリ同期)。
-     */
-    constexpr int BlockColors = 18;   /* 17 バリエーション + 基本色(+0x110) */
-
-    struct Committed {
-        bool valid = false;
-        teamcolor::Color4f colors[BlockColors]{};
-    };
-    Committed g_Committed[teamcolor::TeamCount][SetCount];
-
-    void SnapshotBlock(int team, int set) {
-        teamcolor::Color4f* block = GetBlock(team, set);
-        if (block == nullptr) return;
-        for (int k = 0; k < BlockColors; k++) g_Committed[team][set].colors[k] = block[k];
-        g_Committed[team][set].valid = true;
-    }
-
-    /* ------------------------------------------------------------------ */
-    /*  メモリ同期                                                         */
-    /*                                                                    */
-    /*  1. 試合が始まったら、裏方スレッドでゲームのメモリを一度だけ探し、  */
-    /*     チームの色が写されている場所を一覧にしておく(準備)。          */
-    /*  2. 色を変えたときは、その一覧の場所だけを書き換える。              */
-    /*     → メモリ全体を探し直さないので、ほぼ一瞬で変わる。              */
-    /* ------------------------------------------------------------------ */
-
-    namespace sync {
-        constexpr int Slots = teamcolor::TeamCount * SetCount * BlockColors;
-
-        /* 探す値(控えの色) */
-        struct Pat { u32 f[3]; u16 h[3]; bool half; u16 slot; };
-        /* 見つかった場所 */
-        struct Entry { uintptr_t addr; u16 slot; u8 width; };
-
-        constexpr int    MaxEntries = 32768;
-        constexpr size_t ChunkBytes = 64u << 10;
-
-        Pat       g_Pats[Slots];
-        int       g_PatCount = 0;
-        Entry     g_Entries[MaxEntries];
-        int       g_EntryCount = 0;
-        bool      g_Overflow = false;
-        u64       g_Bloom[65536 / 64];
-        u64       g_Bloom16[65536 / 64];
-
-        bool      g_Indexing = false;  /* 裏方スレッドが探している最中 */
-        bool      g_Ready = false;     /* 一覧が使える */
-        bool      g_Stale = false;     /* 探している間にゲームが色をセットし直した */
-        bool      g_Request = false;
-        bool      g_WorkerStarted = false;
-        int       g_Pass = 0;          /* 0: 普通のメモリ, 1: キャッシュされないメモリ */
-        uintptr_t g_Next = 0, g_Cur = 0, g_End = 0;
-        u64       g_Total = 0, g_Done = 0;
-
-        alignas(0x1000) u8 g_Stack[0x10000];
-        alignas(0x10) u8 g_ThreadStorage[0x400];  /* nn::os::ThreadType(SDK の版で大きさが違っても足りるよう多めに) */
-
-        u32 Bits(float f) { u32 u; std::memcpy(&u, &f, 4); return u; }
-        u16 HalfBits(float f) { __fp16 h = (__fp16) f; u16 u; std::memcpy(&u, &h, 2); return u; }
-        u32 Hash(u32 w) { return (w ^ (w >> 16)) & 0xFFFF; }
-
-        void SlotToIndex(int slot, int& team, int& set, int& k) {
-            k = slot % BlockColors;
-            set = (slot / BlockColors) % SetCount;
-            team = slot / (BlockColors * SetCount);
-        }
-
-        bool IsTrivial(const teamcolor::Color4f& c) {
-            auto t = [](float v) { return v == 0.0f || v == 1.0f; };
-            return t(c.r) && t(c.g) && t(c.b);
-        }
-
-        bool Scannable(const MemoryInfo& mi) {
-            if ((mi.perm & Perm_Rw) != Perm_Rw) return false;
-            bool uncached = (mi.attr & MemAttr_IsUncached) != 0;
-            if (uncached != (g_Pass == 1)) return false;
-            /* 途中で消えることのないメモリだけ */
-            switch (mi.type & MemState_Type) {
-                case MemType_Heap: case MemType_CodeMutable: case MemType_ModuleCodeMutable:
-                    break;
-                default:
-                    return false;
-            }
-            /* 自分自身(このプラグイン)は除く */
-            const auto& self = exl::util::GetSelfModuleInfo().m_Total;
-            if (mi.addr < self.GetEnd() && mi.addr + mi.size > self.m_Start) return false;
-            return true;
-        }
-
-        bool NextRegion() {
-            while (true) {
-                MemoryInfo mi{}; u32 pi;
-                if (R_FAILED(svcQueryMemory(&mi, &pi, g_Next))) return false;
-                uintptr_t end = mi.addr + mi.size;
-                if (mi.size == 0 || end <= g_Next) return false;
-                g_Next = end;
-                if (Scannable(mi)) { g_Cur = mi.addr; g_End = end; return true; }
-            }
-        }
-
-        u64 CountTotal() {
-            u64 total = 0;
-            int saved = g_Pass;
-            for (g_Pass = 0; g_Pass < 2; g_Pass++) {
-                uintptr_t next = 0;
-                while (true) {
-                    MemoryInfo mi{}; u32 pi;
-                    if (R_FAILED(svcQueryMemory(&mi, &pi, next))) break;
-                    uintptr_t end = mi.addr + mi.size;
-                    if (mi.size == 0 || end <= next) break;
-                    next = end;
-                    if (Scannable(mi)) total += mi.size;
-                }
-            }
-            g_Pass = saved;
-            return total;
-        }
-
-        void Record(uintptr_t addr, u16 slot, u8 width) {
-            if (g_EntryCount >= MaxEntries) { g_Overflow = true; return; }
-            g_Entries[g_EntryCount++] = { addr, slot, width };
-        }
-
-        void IndexRange(uintptr_t start, size_t bytes) {
-            const volatile u32* p = reinterpret_cast<const volatile u32*>(start);
-            size_t n = bytes / 4;
-            for (size_t i = 0; i + 2 < n; i++) {
-                u32 w = p[i];
-                u32 h = Hash(w);
-                if (!(g_Bloom[h >> 6] & (1ull << (h & 63)))) continue;
-                for (int k = 0; k < g_PatCount; k++) {
-                    const Pat& pt = g_Pats[k];
-                    if (w != pt.f[0] || p[i + 1] != pt.f[1] || p[i + 2] != pt.f[2]) continue;
-                    Record(start + i * 4, pt.slot, 4);
-                    i += 2;
-                    break;
-                }
-            }
-            const volatile u16* q = reinterpret_cast<const volatile u16*>(start);
-            size_t m = bytes / 2;
-            for (size_t i = 0; i + 2 < m; i++) {
-                u16 w = q[i];
-                if (!(g_Bloom16[w >> 6] & (1ull << (w & 63)))) continue;
-                for (int k = 0; k < g_PatCount; k++) {
-                    const Pat& pt = g_Pats[k];
-                    if (!pt.half || w != pt.h[0] || q[i + 1] != pt.h[1] || q[i + 2] != pt.h[2]) continue;
-                    Record(start + i * 2, pt.slot, 2);
-                    i += 2;
-                    break;
-                }
-            }
-        }
-
-        void RunIndex() {
-            g_EntryCount = 0; g_Overflow = false;
-            g_Pass = 0; g_Next = 0; g_Cur = g_End = 0; g_Done = 0;
-            g_Total = CountTotal();
-            size_t sinceYield = 0;
-            while (true) {
-                if (g_Cur >= g_End && !NextRegion()) {
-                    if (g_Pass == 0) { g_Pass = 1; g_Next = 0; g_Cur = g_End = 0; continue; }
-                    break;
-                }
-                MemoryInfo mi{}; u32 pi;
-                if (R_FAILED(svcQueryMemory(&mi, &pi, g_Cur)) || !Scannable(mi)) { g_Cur = g_End; continue; }
-                uintptr_t limit = mi.addr + mi.size < g_End ? mi.addr + mi.size : g_End;
-                size_t len = limit - g_Cur;
-                if (len > ChunkBytes) len = ChunkBytes;
-                IndexRange(g_Cur, len);
-                g_Cur += len; g_Done += len;
-                sinceYield += len;
-                if (sinceYield >= (1u << 20)) { sinceYield = 0; nn::os::YieldThread(); }
-            }
-            bool stale = __atomic_exchange_n(&g_Stale, false, __ATOMIC_ACQ_REL);
-            __atomic_store_n(&g_Ready, !stale, __ATOMIC_RELEASE);
-            __atomic_store_n(&g_Indexing, false, __ATOMIC_RELEASE);
-        }
-
-        void (*g_ExtraJob)() = nullptr;  /* 値さがし */
-
-        void Worker(void*) {
-            while (true) {
-                if (__atomic_exchange_n(&g_Request, false, __ATOMIC_ACQ_REL)) RunIndex();
-                else if (g_ExtraJob) g_ExtraJob();
-                nn::os::SleepThread(nn::TimeSpan::FromMilliSeconds(20));
-            }
-        }
-
-        void StartWorker() {
-            if (g_WorkerStarted) return;
-            auto* thread = reinterpret_cast<nn::os::ThreadType*>(g_ThreadStorage);
-            /* 優先度 31 = 一番低い。ゲームが空いている時間だけ動く。コア 0〜2 のどこでも */
-            if (R_FAILED(nn::os::CreateThread(thread, &Worker, nullptr, g_Stack, sizeof(g_Stack), 31))) return;
-            nn::os::SetThreadCoreMask(thread, 2, 0x7);
-            nn::os::SetThreadNamePointer(thread, "ChromaSync");
-            nn::os::StartThread(thread);
-            g_WorkerStarted = true;
-        }
-
-        float Progress() { return g_Total ? Clamp01((float) g_Done / (float) g_Total) : 0.0f; }
-        bool  Indexing() { return __atomic_load_n(&g_Indexing, __ATOMIC_ACQUIRE); }
-        bool  Ready()    { return __atomic_load_n(&g_Ready, __ATOMIC_ACQUIRE); }
-    }
-
-    /* ------------------------------------------------------------------ */
-    /*  値さがし(スペシャルゲージなどの場所をゲーム中に絞り込む)          */
-    /* ------------------------------------------------------------------ */
-
-}
-
-namespace nn::nifm { bool IsNetworkAvailable(); }
-namespace nn::ro   { Result LookupSymbol(uintptr_t* out, const char* name); }
-
-namespace chroma {
-
-    /* 対戦に影響する機能は、通信しているときは動かさない */
-    bool IsOnline() {
-        /*
-         * nn::ldn(ローカル通信)の状態は、ゲームがローカル通信を始める前に聞くと
-         * 止まってしまうので使わない。インターネットにつながっているかだけを見る。
-         */
-        return nn::nifm::IsNetworkAvailable();
-    }
-
-    namespace search {
-        enum Kind : u8 { S32 = 0, F32 = 1, Ratio = 2 };  /* 整数 / 小数 / 割合(満タン = 1.0) */
-        enum Op { New, EqFull, EqZero, Increased, Decreased, Unchanged };
-
-        struct Cand { uintptr_t addr; u32 last; u8 kind; bool lock; };
-
-        Cand*  g_Cands = nullptr;
-        int    g_Cap = 0;
-        int    g_Count = 0;
-        bool   g_TooMany = false;
-        bool   g_HasScan = false;
-        int    g_Value = 200;      /* メニューで決める値(満タンのときのポイント) */
-        bool   g_AlsoRatio = true; /* 満タン = 1.0 の小数も探す */
-        int    g_ScanValue = 200;
-        bool   g_ScanRatio = true;
-
-        bool   g_Busy = false;
-        bool   g_Request = false;
-        Op     g_Op = New;
-        u64    g_Total = 0, g_Done = 0;
-
-        bool Alloc() {
-            if (g_Cands) return true;
-            uintptr_t fn = 0;
-            if (R_FAILED(nn::ro::LookupSymbol(&fn, "malloc")) || fn == 0) return false;
-            auto mallocFn = reinterpret_cast<void* (*)(size_t)>(fn);
-            for (int cap = 393216; cap >= 32768; cap /= 2) {  /* 6MB から、だめなら小さく */
-                void* p = mallocFn(sizeof(Cand) * (size_t) cap);
-                if (p) { g_Cands = reinterpret_cast<Cand*>(p); g_Cap = cap; return true; }
-            }
-            return false;
-        }
-
-        /* ゲームのデータが入る、途中で消えないメモリだけ */
-        bool Searchable(const MemoryInfo& mi) {
-            if ((mi.perm & Perm_Rw) != Perm_Rw) return false;
-            if ((mi.type & MemState_Type) != MemType_Heap) return false;
-            const auto& self = exl::util::GetSelfModuleInfo().m_Total;
-            if (mi.addr < self.GetEnd() && mi.addr + mi.size > self.m_Start) return false;
-            return true;
-        }
-
-        /* addr がまだ読めるか(候補はアドレス順なので、領域ごとに1回だけ確かめる) */
-        struct RegionCache {
-            uintptr_t start = 0, end = 0;
-            bool ok = false;
-            bool Check(uintptr_t addr) {
-                if (addr >= start && addr + 4 <= end) return ok;
-                MemoryInfo mi{}; u32 pi;
-                if (R_FAILED(svcQueryMemory(&mi, &pi, addr))) { start = end = 0; ok = false; return false; }
-                start = mi.addr; end = mi.addr + mi.size; ok = Searchable(mi);
-                return ok && addr + 4 <= end;
-            }
-        };
-
-        u32 FullBits(const Cand& c) {
-            if (c.kind == S32) { u32 u = (u32) g_ScanValue; return u; }
-            if (c.kind == F32) return sync::Bits((float) g_ScanValue);
-            return 0x3F800000u;  /* 1.0f */
-        }
-
-        bool Greater(const Cand& c, u32 a, u32 b) {  /* a > b ? */
-            if (c.kind == S32) return (s32) a > (s32) b;
-            float fa, fb; std::memcpy(&fa, &a, 4); std::memcpy(&fb, &b, 4);
-            return fa > fb;
-        }
-
-        void Push(uintptr_t addr, u32 v, u8 kind) {
-            if (g_Count >= g_Cap) { g_TooMany = true; return; }
-            g_Cands[g_Count++] = { addr, v, kind, false };
-        }
-
-        void RunNew() {
-            g_Count = 0; g_TooMany = false;
-            g_ScanValue = g_Value; g_ScanRatio = g_AlsoRatio;
-            u32 s = (u32) g_ScanValue, f = sync::Bits((float) g_ScanValue), r = 0x3F800000u;
-
-            /* 全体の大きさ(進み具合の表示用) */
-            g_Total = 0; g_Done = 0;
-            for (uintptr_t next = 0;;) {
-                MemoryInfo mi{}; u32 pi;
-                if (R_FAILED(svcQueryMemory(&mi, &pi, next))) break;
-                uintptr_t end = mi.addr + mi.size;
-                if (mi.size == 0 || end <= next) break;
-                next = end;
-                if (Searchable(mi)) g_Total += mi.size;
-            }
-
-            size_t sinceYield = 0;
-            for (uintptr_t next = 0; !g_TooMany;) {
-                MemoryInfo mi{}; u32 pi;
-                if (R_FAILED(svcQueryMemory(&mi, &pi, next))) break;
-                uintptr_t end = mi.addr + mi.size;
-                if (mi.size == 0 || end <= next) break;
-                next = end;
-                if (!Searchable(mi)) continue;
-                for (uintptr_t cur = mi.addr; cur < end && !g_TooMany; cur += 0x10000) {
-                    uintptr_t lim = cur + 0x10000 < end ? cur + 0x10000 : end;
-                    const volatile u32* p = reinterpret_cast<const volatile u32*>(cur);
-                    size_t n = (lim - cur) / 4;
-                    for (size_t i = 0; i < n; i++) {
-                        u32 w = p[i];
-                        if (w == s) Push(cur + i * 4, w, S32);
-                        else if (w == f) Push(cur + i * 4, w, F32);
-                        else if (g_ScanRatio && w == r) Push(cur + i * 4, w, Ratio);
-                    }
-                    g_Done += lim - cur;
-                    sinceYield += lim - cur;
-                    if (sinceYield >= (1u << 20)) { sinceYield = 0; nn::os::YieldThread(); }
-                }
-            }
-            g_HasScan = !g_TooMany;
-            if (g_TooMany) g_Count = 0;
-        }
-
-        void RunNext(Op op) {
-            RegionCache rc;
-            int out = 0;
-            g_Total = (u64) g_Count; g_Done = 0;
-            for (int i = 0; i < g_Count; i++, g_Done++) {
-                Cand c = g_Cands[i];
-                if (!rc.Check(c.addr)) continue;
-                u32 v = *reinterpret_cast<const volatile u32*>(c.addr);
-                bool keep = false;
-                switch (op) {
-                    case EqFull:    keep = v == FullBits(c); break;
-                    case EqZero:    keep = v == 0; break;
-                    case Increased: keep = Greater(c, v, c.last); break;
-                    case Decreased: keep = Greater(c, c.last, v); break;
-                    case Unchanged: keep = v == c.last; break;
-                    default: break;
-                }
-                if (!keep) continue;
-                c.last = v;
-                g_Cands[out++] = c;
-                if ((i & 0xFFFF) == 0) nn::os::YieldThread();
-            }
-            g_Count = out;
-        }
-
-        void Job() {
-            if (!__atomic_exchange_n(&g_Request, false, __ATOMIC_ACQ_REL)) return;
-            if (g_Op == New) RunNew(); else RunNext(g_Op);
-            __atomic_store_n(&g_Busy, false, __ATOMIC_RELEASE);
-        }
-
-        bool Busy() { return __atomic_load_n(&g_Busy, __ATOMIC_ACQUIRE); }
-
-        void Request(Op op) {
-            if (Busy()) return;
-            if (op != New && !g_HasScan) return;
-            if (!Alloc()) { g_TooMany = true; return; }
-            g_Op = op;
-            __atomic_store_n(&g_Busy, true, __ATOMIC_RELEASE);
-            sync::g_ExtraJob = &Job;
-            sync::StartWorker();
-            __atomic_store_n(&g_Request, true, __ATOMIC_RELEASE);
-        }
-
-        float Progress() { return g_Total ? Clamp01((float) g_Done / (float) g_Total) : 0.0f; }
-
-        /*
-         * 見つかった場所が、どのオブジェクトの何番目の値かを推測する。
-         * オブジェクトの先頭には、たいてい main の中を指すポインタ(vtable)がある。
-         * いちばん近いものを探して「main からの位置」と「そこからの距離」を返す。
-         */
-        bool FindOwner(uintptr_t addr, uintptr_t& vtOff, uintptr_t& field) {
-            uintptr_t mainStart = exl::util::modules::GetTargetStart();
-            uintptr_t lo = mainStart + 0x4e90000, hi = mainStart + 0x6100000;
-            MemoryInfo mi{}; u32 pi;
-            if (R_FAILED(svcQueryMemory(&mi, &pi, addr)) || !Searchable(mi)) return false;
-            uintptr_t a = addr & ~(uintptr_t) 7;
-            for (uintptr_t back = 0; back <= 0x2000 && a - back >= mi.addr; back += 8) {
-                u64 q = *reinterpret_cast<const volatile u64*>(a - back);
-                if (q >= lo && q < hi) {
-                    vtOff = q - mainStart;
-                    field = addr - (a - back);
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        /* 固定した値を毎フレーム書き戻す(オフラインのときだけ) */
-        void ApplyLocks() {
-            if (g_Busy || g_Count > 6 || g_Cands == nullptr) return;
-            bool any = false;
-            for (int i = 0; i < g_Count; i++) any |= g_Cands[i].lock;
-            if (!any) return;  /* 固定しているものが無ければ何もしない */
-            bool online = IsOnline();
-            for (int i = 0; i < g_Count; i++) {
-                Cand& c = g_Cands[i];
-                if (!c.lock) continue;
-                if (online) { c.lock = false; continue; }
-                MemoryInfo mi{}; u32 pi;
-                if (R_FAILED(svcQueryMemory(&mi, &pi, c.addr)) || !Searchable(mi)) { c.lock = false; continue; }
-                *reinterpret_cast<volatile u32*>(c.addr) = FullBits(c);
-            }
-        }
-    }
-
-    /* 控えの色(いまゲームの中に写されている色)を探す準備をして、裏方に頼む */
-    void StartIndex() {
-        if (sync::Indexing()) return;
-        sync::g_PatCount = 0;
-        std::memset(sync::g_Bloom, 0, sizeof(sync::g_Bloom));
-        std::memset(sync::g_Bloom16, 0, sizeof(sync::g_Bloom16));
-        for (int slot = 0; slot < sync::Slots; slot++) {
-            int team, set, k;
-            sync::SlotToIndex(slot, team, set, k);
-            const Committed& c = g_Committed[team][set];
-            if (!c.valid) continue;
-            const teamcolor::Color4f& o = c.colors[k];
-            if (sync::IsTrivial(o)) continue;  /* (1,0,0) などは他のデータと紛らわしいので探さない */
-            sync::Pat& pt = sync::g_Pats[sync::g_PatCount++];
-            pt.f[0] = sync::Bits(o.r); pt.f[1] = sync::Bits(o.g); pt.f[2] = sync::Bits(o.b);
-            pt.h[0] = sync::HalfBits(o.r); pt.h[1] = sync::HalfBits(o.g); pt.h[2] = sync::HalfBits(o.b);
-            auto triv = [](u16 v) { return v == 0x0000 || v == 0x3C00; };
-            pt.half = !(triv(pt.h[0]) && triv(pt.h[1]) && triv(pt.h[2]));
-            pt.slot = (u16) slot;
-            u32 h = sync::Hash(pt.f[0]);
-            sync::g_Bloom[h >> 6] |= 1ull << (h & 63);
-            if (pt.half) sync::g_Bloom16[pt.h[0] >> 6] |= 1ull << (pt.h[0] & 63);
-        }
-        if (sync::g_PatCount == 0) return;
-        __atomic_store_n(&sync::g_Ready, false, __ATOMIC_RELEASE);
-        __atomic_store_n(&sync::g_Indexing, true, __ATOMIC_RELEASE);
-        sync::StartWorker();
-        __atomic_store_n(&sync::g_Request, true, __ATOMIC_RELEASE);
-    }
-
-    /* 一覧の場所だけを、控えの色 → 表の今の色 に書き換える(一瞬で終わる) */
-    void ApplyEntries() {
-        for (int i = 0; i < sync::g_EntryCount; i++) {
-            const sync::Entry& e = sync::g_Entries[i];
-            int team, set, k;
-            sync::SlotToIndex(e.slot, team, set, k);
-            teamcolor::Color4f* block = GetBlock(team, set);
-            if (block == nullptr) continue;
-            const teamcolor::Color4f& o = g_Committed[team][set].colors[k];
-            const teamcolor::Color4f& n = block[k];
-            if (e.width == 4) {
-                volatile u32* p = reinterpret_cast<volatile u32*>(e.addr);
-                /* まだ控えの色のままのときだけ書き換える(別のデータに変わっていたら触らない) */
-                if (p[0] != sync::Bits(o.r) || p[1] != sync::Bits(o.g) || p[2] != sync::Bits(o.b)) continue;
-                p[0] = sync::Bits(n.r); p[1] = sync::Bits(n.g); p[2] = sync::Bits(n.b);
-            } else {
-                volatile u16* q = reinterpret_cast<volatile u16*>(e.addr);
-                if (q[0] != sync::HalfBits(o.r) || q[1] != sync::HalfBits(o.g) || q[2] != sync::HalfBits(o.b)) continue;
-                q[0] = sync::HalfBits(n.r); q[1] = sync::HalfBits(n.g); q[2] = sync::HalfBits(n.b);
-            }
-        }
-        /* 控えを今の色に更新 */
-        for (int team = 0; team < teamcolor::TeamCount; team++) {
-            for (int set = 0; set < SetCount; set++) {
-                if (g_Committed[team][set].valid) SnapshotBlock(team, set);
-            }
-        }
-    }
-
-    /*
-     * 地面のインクなど「材質」の色。
-     * 材質が作られるとき、ゲームは 0x1346ba0 で色見本帳からチームの色を読み、
-     * 材質のパラメータに書いて「更新済み」の印を付ける。その後は読み直さない。
-     * そこで呼ばれたときの引数を覚えておき、色を変えたらもう一度呼んでもらう。
-     */
-    namespace paint {
-        using Fn = void (*)(void*, void*, void*);
-        Fn g_Orig = nullptr;
-
-        struct Rec { void* self; void* arg; void* state; uintptr_t check0; uintptr_t check48; };
-        constexpr int MaxRecs = 2048;
-        Rec  g_Recs[MaxRecs];
-        int  g_Count = 0;
-
-        bool Readable(const void* p, size_t n) {
-            MemoryInfo mi{}; u32 pi;
-            uintptr_t a = reinterpret_cast<uintptr_t>(p);
-            if (a == 0 || (a & 7)) return false;
-            if (R_FAILED(svcQueryMemory(&mi, &pi, a))) return false;
-            if ((mi.perm & Perm_Rw) != Perm_Rw) return false;
-            if ((mi.type & MemState_Type) != MemType_Heap) return false;
-            return a + n <= mi.addr + mi.size;
-        }
-
-        uintptr_t Field(void* p, size_t off) { return *reinterpret_cast<uintptr_t*>(reinterpret_cast<u8*>(p) + off); }
-
-        void Record(void* self, void* arg, void* state) {
-            if (!Readable(state, 0x50)) return;
-            for (int i = 0; i < g_Count; i++) {
-                if (g_Recs[i].state == state && g_Recs[i].self == self) {
-                    g_Recs[i].arg = arg;
-                    g_Recs[i].check0 = Field(state, 0);
-                    g_Recs[i].check48 = Field(state, 0x48);
-                    return;
-                }
-            }
-            if (g_Count >= MaxRecs) return;
-            g_Recs[g_Count++] = { self, arg, state, Field(state, 0), Field(state, 0x48) };
-        }
-
-        void Clear() { g_Count = 0; }
-
-        /* 覚えておいた材質に、色見本帳の今の色をもう一度読んでもらう */
-        void RefreshAll() {
-            if (g_Orig == nullptr) return;
-            for (int i = 0; i < g_Count; i++) {
-                Rec& r = g_Recs[i];
-                if (r.state == nullptr) continue;
-                /* 材質がもう無い/別のものに変わっていたら外す */
-                if (!Readable(r.state, 0x50) || Field(r.state, 0) != r.check0 || Field(r.state, 0x48) != r.check48) {
-                    r.state = nullptr;
-                    continue;
-                }
-                g_Orig(r.self, r.arg, r.state);
-            }
-        }
-    }
-
-    bool  g_EverUsed = false;     /* 一度でも OVERRIDE を使ったか(使っていなければ準備もしない) */
-    float g_IndexDelay = -1.0f;   /* 試合の準備から、探し始めるまでの待ち時間 */
-
-    /* フックから呼ばれる: ゲームが色をセットするとき、上書き中なら自分の色にすり替える */
-    void OnSetBlock(teamcolor::Color4f* block, const teamcolor::Color4f* color, u64 a, u64 b, float f) {
-        for (int team = 0; team < teamcolor::TeamCount; team++) {
-            for (int set = 0; set < SetCount; set++) {
-                if (block != GetBlock(team, set)) continue;
-
-                BlockState& s = g_Blocks[team][set];
-                s.valid = true;
-                s.original = *color;
-                s.a = a; s.b = b; s.f = f;
-
-                const TeamOverride& o = g_Teams[team];
-                if (o.enabled) {
-                    teamcolor::Color4f mine{ o.color[0], o.color[1], o.color[2], color->a };
-                    g_OrigSetBlock(block, &mine, a, b, f);
-                } else {
-                    g_OrigSetBlock(block, color, a, b, f);
-                }
-                /* 試合の準備でセットされた色 = これからゲームが写す色。一覧は作り直し */
-                SnapshotBlock(team, set);
-                paint::Clear();
-                __atomic_store_n(&sync::g_Ready, false, __ATOMIC_RELEASE);
-                if (sync::Indexing()) __atomic_store_n(&sync::g_Stale, true, __ATOMIC_RELEASE);
-                g_IndexDelay = 4.0f;  /* キャラや地面が色を写し終わるのを待ってから探す */
-                return;
-            }
-        }
-        g_OrigSetBlock(block, color, a, b, f);
-    }
-
-    /* メニューで変えた色を、ゲームと同じ計算ですぐに作り直す(表だけ) */
-    void ReapplyTeam(int team) {
-        if (g_OrigSetBlock == nullptr) return;
-        const TeamOverride& o = g_Teams[team];
-        for (int set = 0; set < SetCount; set++) {
-            BlockState& s = g_Blocks[team][set];
-            teamcolor::Color4f* block = GetBlock(team, set);
-            if (!s.valid || block == nullptr) continue;
-            if (!g_Committed[team][set].valid) SnapshotBlock(team, set);
-            if (o.enabled) {
-                teamcolor::Color4f mine{ o.color[0], o.color[1], o.color[2], s.original.a };
-                g_OrigSetBlock(block, &mine, s.a, s.b, s.f);
-            } else {
-                g_OrigSetBlock(block, &s.original, s.a, s.b, s.f);
-            }
-        }
-    }
-
-    /* 毎フレーム呼ぶ */
-    void ApplyTeamColors(float dt) {
-        static bool  lastEnabled[teamcolor::TeamCount] = {};
-        static float lastColor[teamcolor::TeamCount][3] = {};
-        static bool  pending = false;
-        bool paintDirty = false;
-
-        for (int team = 0; team < teamcolor::TeamCount; team++) {
-            const TeamOverride& o = g_Teams[team];
-            if (o.enabled) g_EverUsed = true;
-            bool changed = o.enabled != lastEnabled[team];
-            if (o.enabled) {
-                for (int c = 0; c < 3; c++) changed |= o.color[c] != lastColor[team][c];
-            }
-            if (!changed) continue;
-
-            ReapplyTeam(team);  /* 発射するインクなどはこれだけで変わる */
-            paintDirty = true;
-            lastEnabled[team] = o.enabled;
-            for (int c = 0; c < 3; c++) lastColor[team][c] = o.color[c];
-            pending = true;
-        }
-
-        /* 地面などの材質は、色見本帳を読み直してもらうだけで一瞬で変わる */
-        if (paintDirty) paint::RefreshAll();
-
-        /* 試合が始まって少し待ったら、裏方で一覧を作っておく */
-        if (g_IndexDelay >= 0.0f) {
-            g_IndexDelay -= dt;
-            if (g_IndexDelay < 0.0f && g_EverUsed && !sync::Indexing()) StartIndex();
-            else if (g_IndexDelay < 0.0f) g_IndexDelay = 0.0f;  /* 前の準備が終わるのを待つ */
-            if (!g_EverUsed) g_IndexDelay = -1.0f;
-        }
-
-        if (!pending) return;
-        if (sync::Ready()) {
-            ApplyEntries();  /* 一覧があれば一瞬で書き換え */
-            pending = false;
-        } else if (!sync::Indexing() && g_IndexDelay < 0.0f) {
-            StartIndex();    /* 一覧がまだ無ければ作る(できたら上で書き換える) */
-        }
-    }
-
     /* ------------------------------------------------------------------ */
     /*  見た目                                                             */
     /* ------------------------------------------------------------------ */
 
     namespace pal {
-        /* ネオン系のポップな配色 */
-        constexpr ImU32 Pink   = IM_COL32(255,  62, 165, 255);
-        constexpr ImU32 Lime   = IM_COL32(198, 255,   0, 255);
-        constexpr ImU32 Cyan   = IM_COL32( 25, 211, 243, 255);
-        constexpr ImU32 Purple = IM_COL32(123,  47, 255, 255);
-        constexpr ImU32 Orange = IM_COL32(255, 138,   0, 255);
-        constexpr ImU32 Ink    = IM_COL32( 22,  14,  38, 255);
-        constexpr ImU32 White  = IM_COL32(255, 255, 255, 255);
-
-        constexpr ImU32 Cycle[] = { Pink, Lime, Cyan, Orange, Purple };
-        constexpr int CycleCount = sizeof(Cycle) / sizeof(Cycle[0]);
+        constexpr ImU32 White = IM_COL32(255, 255, 255, 255);
 
         ImU32 WithAlpha(ImU32 c, float a) {
             int ai = (int) (a * 255.0f);
@@ -816,6 +61,12 @@ namespace chroma {
         }
     }
 
+    namespace bw {
+        constexpr ImU32 Black = IM_COL32(0, 0, 0, 255);
+        constexpr ImU32 White = IM_COL32(255, 255, 255, 255);
+        constexpr ImU32 Gray  = IM_COL32(150, 150, 150, 255);
+        constexpr ImU32 Panel = IM_COL32(8, 8, 8, 230);
+    }
 
     /* イージング: ぽよんと跳ねる */
     float EaseOutBack(float t) {
@@ -825,36 +76,125 @@ namespace chroma {
         return 1.0f + c3 * u * u * u + c1 * u * u;
     }
 
-    /* インクのしぶき(大きな円 + まわりの小さな粒) */
-    void DrawSplat(ImDrawList* dl, ImVec2 c, float r, ImU32 col, int seed) {
-        dl->AddCircleFilled(c, r, col, 32);
-        for (int i = 0; i < 7; i++) {
-            float ang  = (float) (seed * 37 + i * 53) * 0.1745f;
-            float dist = r * (1.05f + 0.35f * (float) ((seed + i * 7) % 5) / 4.0f);
-            float rr   = r * (0.14f + 0.10f * (float) ((seed * 3 + i) % 4) / 3.0f);
-            dl->AddCircleFilled(ImVec2(c.x + cosf(ang) * dist, c.y + sinf(ang) * dist), rr, col, 16);
+    /* ------------------------------------------------------------------ */
+    /*  フォント                                                           */
+    /* ------------------------------------------------------------------ */
+
+    namespace fonts {
+        constexpr float BakeSize = 36.0f;  /* 大きめに作って縮めて使う(拡大してもぼやけにくい) */
+
+        enum Id { JetBrains = 0, SwitchStd, Proggy, Count };
+        const char* const Names[Count] = { "JETBRAINS MONO", "SWITCH", "PROGGY (PIXEL)" };
+
+        ImFont* g_Fonts[Count] = {};
+
+        /* Switch 本体の共有フォント(読み込みが終わるまで少し待つ) */
+        ImFont* AddShared(nn::pl::SharedFontType type) {
+            for (int i = 0; i < 200 && nn::pl::GetSharedFontLoadState(type) != nn::pl::SharedFontLoadState_Loaded; i++) {
+                nn::os::SleepThread(nn::TimeSpan::FromMilliSeconds(10));
+            }
+            if (nn::pl::GetSharedFontLoadState(type) != nn::pl::SharedFontLoadState_Loaded) return nullptr;
+            const void* data = nn::pl::GetSharedFontAddress(type);
+            size_t size = nn::pl::GetSharedFontSize(type);
+            if (data == nullptr || size == 0) return nullptr;
+            ImFontConfig cfg;
+            cfg.FontDataOwnedByAtlas = false;  /* 本体のメモリなので ImGui に解放させない */
+            cfg.OversampleH = 2;
+            return ImGui::GetIO().Fonts->AddFontFromMemoryTTF(const_cast<void*>(data), (int) size, BakeSize, &cfg);
+        }
+
+        /* imgui-xeno が既定フォント(JetBrains Mono)を足す前に呼ばれる */
+        void OnPreInit() {
+            ImGuiIO& io = ImGui::GetIO();
+            g_Fonts[SwitchStd]    = AddShared(nn::pl::SharedFontType_Standard);
+            ImFontConfig proggy;
+            proggy.SizePixels = 26.0f;
+            g_Fonts[Proggy] = io.Fonts->AddFontDefault(&proggy);
+        }
+
+        /* 既定フォントは最後に足されるので、初期化のあとに拾う */
+        void OnPostInit() {
+            ImGuiIO& io = ImGui::GetIO();
+            if (io.Fonts->Fonts.Size > 0) g_Fonts[JetBrains] = io.Fonts->Fonts[io.Fonts->Fonts.Size - 1];
+        }
+
+        bool Available(int id) { return id >= 0 && id < Count && g_Fonts[id] != nullptr; }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*  設定(SD に保存)                                                  */
+    /* ------------------------------------------------------------------ */
+
+    namespace settings {
+        constexpr const char* Path = "sd:/ChromaRush/settings.txt";
+        constexpr int ScaleMin = 50, ScaleMax = 200, ScaleStep = 5;
+
+        int  g_Font      = fonts::JetBrains;
+        int  g_MenuScale = 100;  /* % */
+        int  g_TextScale = 100;  /* % */
+        bool g_Loaded    = false;
+        bool g_Dirty     = false;
+
+        int ClampScale(int v) { return v < ScaleMin ? ScaleMin : (v > ScaleMax ? ScaleMax : v); }
+
+        void Load() {
+            g_Loaded = true;
+            if (!storage::EnsureSdMounted()) return;
+            nn::fs::FileHandle h;
+            if (R_FAILED(nn::fs::OpenFile(&h, Path, nn::fs::OpenMode_Read))) return;
+            char buf[256] = {};
+            long size = 0;
+            nn::fs::GetFileSize(&size, h);
+            if (size > 0 && size < (long) sizeof(buf)) nn::fs::ReadFile(h, 0, buf, (ulong) size);
+            nn::fs::CloseFile(h);
+
+            for (char* line = buf; line && *line; ) {
+                char* next = std::strchr(line, '\n');
+                if (next) *next++ = '\0';
+                char* eq = std::strchr(line, '=');
+                if (eq) {
+                    *eq = '\0';
+                    int v = std::atoi(eq + 1);
+                    if (!std::strcmp(line, "font") && fonts::Available(v)) g_Font = v;
+                    else if (!std::strcmp(line, "menu")) g_MenuScale = ClampScale(v);
+                    else if (!std::strcmp(line, "text")) g_TextScale = ClampScale(v);
+                }
+                line = next;
+            }
+        }
+
+        void Save() {
+            g_Dirty = false;
+            if (!storage::EnsureSdMounted()) return;
+            char buf[96];
+            int n = std::snprintf(buf, sizeof(buf), "font=%d\nmenu=%d\ntext=%d\n", g_Font, g_MenuScale, g_TextScale);
+            nn::fs::DeleteFile(Path);
+            if (R_FAILED(nn::fs::CreateFile(Path, n))) return;
+            nn::fs::FileHandle h;
+            if (R_FAILED(nn::fs::OpenFile(&h, Path, nn::fs::OpenMode_Write))) return;
+            nn::fs::WriteFile(h, 0, buf, (u64) n, nn::fs::WriteOption::CreateOption(nn::fs::WriteOptionFlag_Flush));
+            nn::fs::CloseFile(h);
+        }
+
+        void Reset() {
+            g_Font = fonts::JetBrains;
+            g_MenuScale = 100;
+            g_TextScale = 100;
+            g_Dirty = true;
         }
     }
 
-    /* 文字ごとに色を変えて、波のように上下させたタイトル */
-    void DrawBouncyTitle(ImDrawList* dl, const char* text, ImVec2 center, float size, float time, float alpha) {
-        ImFont* font = ImGui::GetFont();
-        ImVec2 total = font->CalcTextSizeA(size, FLT_MAX, 0.0f, text);
-        float x = center.x - total.x * 0.5f;
-        int colorIndex = 0;
-        for (const char* p = text; *p; p++) {
-            char ch[2] = { *p, 0 };
-            ImVec2 sz = font->CalcTextSizeA(size, FLT_MAX, 0.0f, ch);
-            if (*p != ' ') {
-                float bob = sinf(time * 6.0f + (float) (p - text) * 0.55f) * size * 0.08f;
-                ImVec2 pos(x, center.y - total.y * 0.5f + bob);
-                ImU32 col = pal::Cycle[colorIndex++ % pal::CycleCount];
-                /* 影 → 本体 */
-                dl->AddText(font, size, ImVec2(pos.x + size * 0.06f, pos.y + size * 0.06f), pal::WithAlpha(pal::Ink, alpha), ch);
-                dl->AddText(font, size, pos, pal::WithAlpha(col, alpha), ch);
-            }
-            x += sz.x;
-        }
+    ImFont* Font() {
+        if (fonts::Available(settings::g_Font)) return fonts::g_Fonts[settings::g_Font];
+        return ImGui::GetFont();
+    }
+
+    void Text(ImDrawList* dl, float size, ImVec2 pos, ImU32 col, const char* s) {
+        dl->AddText(Font(), size, pos, col, s);
+    }
+
+    float TextW(float size, const char* s) {
+        return Font()->CalcTextSizeA(size, FLT_MAX, 0.0f, s).x;
     }
 
     /* ------------------------------------------------------------------ */
@@ -882,13 +222,11 @@ namespace chroma {
                 return false;
             }
 
-            /* ふわっと出て、ふわっと消える */
             float fade = t > Duration ? 1.0f - (t - Duration) / FadeOut : Clamp01(t / 0.25f);
             ImDrawList* dl = ImGui::GetForegroundDrawList();
             ImVec2 ds = io.DisplaySize;
             float unit = ds.y / 720.0f;
 
-            /* 画面の真ん中に小さなカード */
             float cw = 320 * unit, ch = 120 * unit;
             float pop = EaseOutBack(t / 0.4f);
             ImVec2 c(ds.x * 0.5f, ds.y * 0.5f);
@@ -897,39 +235,32 @@ namespace chroma {
             dl->AddRect(p0, p1, pal::WithAlpha(pal::White, fade), 0, 0, 2 * unit);
             if (pop < 0.9f) return true;
 
-            /* ロゴ */
             {
                 const char* logo = "CHROMA RUSH";
                 float ts = 30 * unit;
-                float tw = ImGui::GetFont()->CalcTextSizeA(ts, FLT_MAX, 0.0f, logo).x;
-                dl->AddText(ImGui::GetFont(), ts, ImVec2(c.x - tw * 0.5f, c.y - 22 * unit - ts * 0.5f), pal::WithAlpha(pal::White, fade), logo);
+                float tw = TextW(ts, logo);
+                Text(dl, ts, ImVec2(c.x - tw * 0.5f, c.y - 22 * unit - ts * 0.5f), pal::WithAlpha(pal::White, fade), logo);
             }
 
-            /* ローディングバー */
-            float bw = 240 * unit, bh = 10 * unit;
-            ImVec2 b0(c.x - bw * 0.5f, c.y + 12 * unit), b1(c.x + bw * 0.5f, b0.y + bh);
+            float bw_ = 240 * unit, bh = 10 * unit;
+            ImVec2 b0(c.x - bw_ * 0.5f, c.y + 12 * unit), b1(c.x + bw_ * 0.5f, b0.y + bh);
             float prog = Clamp01(t / (Duration - 0.2f));
             prog = 1.0f - (1.0f - prog) * (1.0f - prog);
             dl->AddRect(b0, b1, pal::WithAlpha(pal::White, fade), 0, 0, 1.5f * unit);
             if (prog > 0.01f) {
-                dl->AddRectFilled(ImVec2(b0.x + 3 * unit, b0.y + 3 * unit), ImVec2(b0.x + 3 * unit + (bw - 6 * unit) * prog, b1.y - 3 * unit),
+                dl->AddRectFilled(ImVec2(b0.x + 3 * unit, b0.y + 3 * unit), ImVec2(b0.x + 3 * unit + (bw_ - 6 * unit) * prog, b1.y - 3 * unit),
                                   pal::WithAlpha(pal::White, fade));
             }
 
             char label[24];
             snprintf(label, sizeof(label), "LOADING %d%%", (int) (prog * 100.0f));
             float ls = 14 * unit;
-            float lw = ImGui::GetFont()->CalcTextSizeA(ls, FLT_MAX, 0.0f, label).x;
-            dl->AddText(ImGui::GetFont(), ls, ImVec2(c.x - lw * 0.5f, b1.y + 8 * unit), pal::WithAlpha(IM_COL32(170, 170, 170, 255), fade), label);
+            float lw = TextW(ls, label);
+            Text(dl, ls, ImVec2(c.x - lw * 0.5f, b1.y + 8 * unit), pal::WithAlpha(IM_COL32(170, 170, 170, 255), fade), label);
 
             return true;
         }
     }
-
-    /* ------------------------------------------------------------------ */
-    /*  コントローラー操作                                                 */
-    /* ------------------------------------------------------------------ */
-
 }
 
 /* imgui-xeno の入力ヘルパーが持つフラグ */
@@ -948,147 +279,57 @@ namespace chroma {
     bool Pressed(ImGuiKey k, bool repeat = true) { return ImGui::IsKeyPressed(k, repeat); }
     bool PressedUp()    { return Pressed(ImGuiKey_GamepadDpadUp)   || Pressed(ImGuiKey_GamepadLStickUp); }
     bool PressedDown()  { return Pressed(ImGuiKey_GamepadDpadDown) || Pressed(ImGuiKey_GamepadLStickDown); }
-    bool HeldLeft()     { return ImGui::IsKeyDown(ImGuiKey_GamepadDpadLeft); }
-    bool HeldRight()    { return ImGui::IsKeyDown(ImGuiKey_GamepadDpadRight); }
-    bool PressedLeft()  { return Pressed(ImGuiKey_GamepadDpadLeft, false); }
-    bool PressedRight() { return Pressed(ImGuiKey_GamepadDpadRight, false); }
+    bool PressedLeftR() { return Pressed(ImGuiKey_GamepadDpadLeft); }   /* 押し続けると連続 */
+    bool PressedRightR(){ return Pressed(ImGuiKey_GamepadDpadRight); }
     bool PressedDecide(){ return Pressed(ImGuiKey_GamepadL1, false); }          /* L で決定 */
     bool PressedBack()  { return Pressed(ImGuiKey_GamepadLStickLeft, false); }  /* 左スティックを左: 戻る/閉じる */
 
     /* ------------------------------------------------------------------ */
-    /*  色の選び方: 虹色(色相) + 明るさ                                    */
+    /*  メニュー                                                           */
     /* ------------------------------------------------------------------ */
 
-    struct Picker {
-        bool  init  = false;
-        float hue   = 0.0f;  /* 0..1 虹色の位置 */
-        float shade = 0.0f;  /* -1 (暗い) .. 0 (あざやか) .. 1 (白っぽい) */
-    };
-    Picker g_Pickers[teamcolor::TeamCount];
-
-    void PickerToRgb(const Picker& p, float out[3]) {
-        float sat = p.shade > 0.0f ? 1.0f - p.shade : 1.0f;
-        float val = p.shade < 0.0f ? 1.0f + p.shade : 1.0f;
-        ImGui::ColorConvertHSVtoRGB(p.hue, sat, val, out[0], out[1], out[2]);
-        /* ぴったり 0 や 1 は他のデータと紛らわしいので、ほんの少しだけずらす */
-        for (int i = 0; i < 3; i++) out[i] = out[i] * 0.996f + 0.002f;
-    }
-
-    void PickerFromRgb(Picker& p, const float rgb[3]) {
-        float h, s, v;
-        ImGui::ColorConvertRGBtoHSV(rgb[0], rgb[1], rgb[2], h, s, v);
-        p.hue = h;
-        p.shade = v < 0.99f ? v - 1.0f : 1.0f - s;
-        p.init = true;
-    }
-
-    Picker& GetPicker(int team) {
-        Picker& p = g_Pickers[team];
-        if (!p.init) PickerFromRgb(p, g_Teams[team].color);
-        return p;
-    }
-
-    /* ------------------------------------------------------------------ */
-    /*  メニューの状態                                                     */
-    /* ------------------------------------------------------------------ */
-
-    enum class Page { Main, Color, Search, Probe };
+    enum class Page { Main, Settings };
 
     namespace menu {
         Page  g_Page     = Page::Main;
         int   g_Cursor   = 0;
-        int   g_Team     = 0;
         float g_OpenTime = 0.0f;
         bool  g_WasOpen  = false;
-        float g_HoldTime = 0.0f;
     }
 
-    const char* const MainItems[]  = { "INK COLOR", "VALUE SEARCH", "DEATH PROBE", "REPLAY INTRO" };
-    const char* const ColorItems[] = { "TEAM", "OVERRIDE", "COLOR", "SHADE" };
-    constexpr int MainCount  = 4;
-    constexpr int ColorCount = 4;
+    const char* const MainItems[]     = { "SETTINGS" };
+    const char* const SettingsItems[] = { "FONT", "MENU SIZE", "TEXT SIZE", "RESET" };
+    constexpr int MainCount     = sizeof(MainItems) / sizeof(MainItems[0]);
+    constexpr int SettingsCount = sizeof(SettingsItems) / sizeof(SettingsItems[0]);
 
     void GoTo(Page p) {
+        if (menu::g_Page == Page::Settings && p != Page::Settings && settings::g_Dirty) settings::Save();
         menu::g_Page = p;
         menu::g_Cursor = 0;
     }
 
-    /* 左右で値を動かす(押し続けると速くなる)。true なら変化した */
-    bool Slide(float& v, float dt, float lo, float hi, bool wrap) {
-        int dir = 0;
-        if (HeldLeft()) dir = -1;
-        if (HeldRight()) dir = 1;
-        if (dir == 0) { menu::g_HoldTime = 0.0f; return false; }
-
-        float step;
-        if (PressedLeft() || PressedRight()) {
-            step = 1.0f / 120.0f;
-        } else {
-            menu::g_HoldTime += dt;
-            if (menu::g_HoldTime < 0.3f) return false;
-            float speed = 0.15f + 0.45f * Clamp01((menu::g_HoldTime - 0.3f) / 1.2f); /* 1秒あたり */
-            step = speed * dt;
-        }
-        v += dir * step * (hi - lo);
-        if (wrap) {
-            while (v < lo) v += hi - lo;
-            while (v >= hi) v -= hi - lo;
-        } else {
-            v = v < lo ? lo : (v > hi ? hi : v);
-        }
-        return true;
+    void Close() {
+        if (settings::g_Dirty) settings::Save();
+        CloseMenu();
     }
 
-    const char* const SearchItems[] = { "VALUE", "ALSO 1.0", "NEW SCAN", "= VALUE (FULL)", "= 0 (EMPTY)",
-                                        "INCREASED", "DECREASED", "UNCHANGED" };
-    constexpr int SearchItemCount = 8;
-
-    int SearchResultsShown() {
-        return (!search::Busy() && search::g_HasScan && search::g_Count <= 6) ? search::g_Count : 0;
+    /* 使えるフォントだけを順番に切り替える */
+    void StepFont(int dir) {
+        int f = settings::g_Font;
+        for (int i = 0; i < fonts::Count; i++) {
+            f = (f + dir + fonts::Count) % fonts::Count;
+            if (fonts::Available(f)) break;
+        }
+        if (f != settings::g_Font) { settings::g_Font = f; settings::g_Dirty = true; }
     }
 
-    void HandleSearchInput(float dt, bool canDecide) {
-        static float hold = 0.0f;
-        int c = menu::g_Cursor;
-        if (c == 0) {  /* VALUE: 左右で ±1、押し続けると速く */
-            int dir = HeldRight() ? 1 : (HeldLeft() ? -1 : 0);
-            if (dir == 0) { hold = 0.0f; }
-            else if (PressedLeft() || PressedRight()) { search::g_Value += dir; }
-            else {
-                hold += dt;
-                if (hold > 0.3f) search::g_Value += dir * (hold > 1.5f ? 10 : 1);
-            }
-            if (search::g_Value < 1) search::g_Value = 1;
-            if (search::g_Value > 9999) search::g_Value = 9999;
-            return;
-        }
-        if (c == 1) {
-            if ((canDecide && PressedDecide()) || PressedLeft() || PressedRight()) search::g_AlsoRatio = !search::g_AlsoRatio;
-            return;
-        }
-        if (!canDecide || !PressedDecide()) return;
-        switch (c) {
-            case 2: search::Request(search::New); break;
-            case 3: search::Request(search::EqFull); break;
-            case 4: search::Request(search::EqZero); break;
-            case 5: search::Request(search::Increased); break;
-            case 6: search::Request(search::Decreased); break;
-            case 7: search::Request(search::Unchanged); break;
-            default: {
-                int r = c - SearchItemCount;
-                if (r >= 0 && r < SearchResultsShown() && !IsOnline()) {
-                    search::g_Cands[r].lock = !search::g_Cands[r].lock;
-                }
-                break;
-            }
-        }
+    void StepScale(int& v, int dir) {
+        int n = settings::ClampScale(v + dir * settings::ScaleStep);
+        if (n != v) { v = n; settings::g_Dirty = true; }
     }
 
-    void HandleInput(float dt) {
-        int count = menu::g_Page == Page::Main ? MainCount
-                  : menu::g_Page == Page::Color ? ColorCount
-                  : menu::g_Page == Page::Probe ? 1
-                  : SearchItemCount + SearchResultsShown();
+    void HandleInput() {
+        int count = menu::g_Page == Page::Main ? MainCount : SettingsCount;
         if (menu::g_Cursor >= count) menu::g_Cursor = count - 1;
         bool canDecide = menu::g_OpenTime > 0.25f;  /* 開いたときの L を決定と間違えない */
 
@@ -1096,44 +337,25 @@ namespace chroma {
         if (PressedDown()) menu::g_Cursor = (menu::g_Cursor + 1) % count;
 
         if (menu::g_Page == Page::Main) {
-            if (canDecide && PressedDecide()) {
-                switch (menu::g_Cursor) {
-                    case 0: GoTo(Page::Color); break;
-                    case 1: GoTo(Page::Search); break;
-                    case 2: GoTo(Page::Probe); break;
-                    case 3: intro::Restart(); CloseMenu(); break;
-                }
-            }
-            if (PressedBack()) CloseMenu();
+            if (canDecide && PressedDecide() && menu::g_Cursor == 0) GoTo(Page::Settings);
+            if (PressedBack()) Close();
             return;
         }
 
-        if (menu::g_Page == Page::Probe) {
-            if (canDecide && PressedDecide()) probe::Reset();  /* L で 0 に戻す */
-            if (PressedBack()) GoTo(Page::Main);
-            return;
-        }
-
-        if (menu::g_Page == Page::Search) {
-            HandleSearchInput(dt, canDecide);
-            if (PressedBack()) GoTo(Page::Main);
-            return;
-        }
-
-        TeamOverride& o = g_Teams[menu::g_Team];
-        Picker& p = GetPicker(menu::g_Team);
+        int dir = PressedRightR() ? 1 : (PressedLeftR() ? -1 : 0);
         switch (menu::g_Cursor) {
-            case 0: /* TEAM */
-                if ((canDecide && PressedDecide()) || PressedLeft() || PressedRight()) menu::g_Team ^= 1;
+            case 0: /* FONT */
+                if (dir) StepFont(dir);
+                else if (canDecide && PressedDecide()) StepFont(1);
                 break;
-            case 1: /* OVERRIDE */
-                if ((canDecide && PressedDecide()) || PressedLeft() || PressedRight()) o.enabled = !o.enabled;
+            case 1: /* MENU SIZE */
+                if (dir) StepScale(settings::g_MenuScale, dir);
                 break;
-            case 2: /* COLOR (虹色) */
-                if (Slide(p.hue, dt, 0.0f, 1.0f, true)) PickerToRgb(p, o.color);
+            case 2: /* TEXT SIZE */
+                if (dir) StepScale(settings::g_TextScale, dir);
                 break;
-            case 3: /* SHADE */
-                if (Slide(p.shade, dt, -1.0f, 1.0f, false)) PickerToRgb(p, o.color);
+            case 3: /* RESET */
+                if (canDecide && PressedDecide()) settings::Reset();
                 break;
         }
         if (PressedBack()) GoTo(Page::Main);
@@ -1142,51 +364,6 @@ namespace chroma {
     /* ------------------------------------------------------------------ */
     /*  描画(白と黒のシンプルなスタイル)                                 */
     /* ------------------------------------------------------------------ */
-
-    namespace bw {
-        constexpr ImU32 Black = IM_COL32(0, 0, 0, 255);
-        constexpr ImU32 White = IM_COL32(255, 255, 255, 255);
-        constexpr ImU32 Gray  = IM_COL32(150, 150, 150, 255);
-        constexpr ImU32 Panel = IM_COL32(8, 8, 8, 230);
-    }
-
-    void Text(ImDrawList* dl, float size, ImVec2 pos, ImU32 col, const char* s) {
-        dl->AddText(ImGui::GetFont(), size, pos, col, s);
-    }
-
-    float TextW(float size, const char* s) {
-        return ImGui::GetFont()->CalcTextSizeA(size, FLT_MAX, 0.0f, s).x;
-    }
-
-    ImU32 HueColor(float h) {
-        float r, g, b;
-        ImGui::ColorConvertHSVtoRGB(h, 1.0f, 1.0f, r, g, b);
-        return ImGui::GetColorU32(ImVec4(r, g, b, 1.0f));
-    }
-
-    /* 虹色のバー */
-    void DrawRainbow(ImDrawList* dl, ImVec2 p0, ImVec2 p1) {
-        const int seg = 6;
-        float w = (p1.x - p0.x) / seg;
-        for (int i = 0; i < seg; i++) {
-            ImU32 a = HueColor((float) i / seg), b = HueColor((float) (i + 1) / seg);
-            dl->AddRectFilledMultiColor(ImVec2(p0.x + w * i, p0.y), ImVec2(p0.x + w * (i + 1) + 0.5f, p1.y), a, b, b, a);
-        }
-    }
-
-    /* 暗い → あざやか → 白っぽい のバー */
-    void DrawShadeBar(ImDrawList* dl, ImVec2 p0, ImVec2 p1, float hue) {
-        float mx = (p0.x + p1.x) * 0.5f;
-        ImU32 c = HueColor(hue);
-        dl->AddRectFilledMultiColor(p0, ImVec2(mx, p1.y), bw::Black, c, c, bw::Black);
-        dl->AddRectFilledMultiColor(ImVec2(mx, p0.y), p1, c, bw::White, bw::White, c);
-    }
-
-    /* バーの上の目印 */
-    void DrawMarker(ImDrawList* dl, float x, float y0, float y1, float unit) {
-        dl->AddRectFilled(ImVec2(x - 3 * unit, y0 - 4 * unit), ImVec2(x + 3 * unit, y1 + 4 * unit), bw::White);
-        dl->AddRect(ImVec2(x - 3 * unit, y0 - 4 * unit), ImVec2(x + 3 * unit, y1 + 4 * unit), bw::Black, 0, 0, 1.5f * unit);
-    }
 
     struct Layout {
         float x, w, unit, rowH, pad, fs;
@@ -1202,226 +379,85 @@ namespace chroma {
         if (value) Text(dl, L.fs, ImVec2(L.x + L.w - L.pad - TextW(L.fs, value), ty), selected ? bw::Black : bw::Gray, value);
     }
 
-    /* バー付きの行(数字は出さない) */
-    template<typename BarFn>
-    void DrawBarRow(ImDrawList* dl, const Layout& L, float y, bool selected, const char* label, float t, BarFn drawBar) {
-        DrawRow(dl, L, y, selected, label, nullptr);
-        float bx0 = L.x + L.pad + 120 * L.unit, bx1 = L.x + L.w - L.pad - 6 * L.unit;
-        float cy = y + L.rowH * 0.5f;
-        ImVec2 b0(bx0, cy - 7 * L.unit), b1(bx1, cy + 7 * L.unit);
-        drawBar(b0, b1);
-        dl->AddRect(b0, b1, selected ? bw::Black : bw::Gray, 0, 0, 1.0f * L.unit);
-        DrawMarker(dl, bx0 + (bx1 - bx0) * Clamp01(t), b0.y, b1.y, L.unit);
-    }
-
     /* メニューを閉じているときの小さな表示 */
-    void DrawClosedTab(ImDrawList* dl, float unit) {
+    void DrawClosedTab(ImDrawList* dl, float unit, float text) {
         const char* s = "CHROMA RUSH   L : MENU";
-        float fs = 14 * unit;
+        float fs = 14 * unit * text;
         ImVec2 p0(20 * unit, 16 * unit);
         ImVec2 p1(p0.x + TextW(fs, s) + 20 * unit, p0.y + fs + 12 * unit);
         dl->AddRectFilled(p0, p1, IM_COL32(0, 0, 0, 160));
         Text(dl, fs, ImVec2(p0.x + 10 * unit, p0.y + 6 * unit), IM_COL32(255, 255, 255, 200), s);
     }
 
-    /* 調査ページ: 回数は 0 に戻せる。表示は「回数」と「最後の呼び出し元(main からの位置)」 */
-    void DrawProbePage(ImDrawList* dl, float unit) {
-        Layout L{ 36 * unit, 560 * unit, unit, 32 * unit, 16 * unit, 17 * unit };
-        float headerH = 48 * unit, footerH = 30 * unit;
-        float h = headerH + L.rowH * (probe::Count + 1) + footerH;
-        float top = 24 * unit;
-        float alpha = Clamp01(menu::g_OpenTime / 0.15f);
-        dl->AddRectFilled(ImVec2(L.x, top), ImVec2(L.x + L.w, top + h), pal::WithAlpha(bw::Panel, 0.9f * alpha));
-        dl->AddRect(ImVec2(L.x, top), ImVec2(L.x + L.w, top + h), bw::White, 0, 0, 2 * unit);
-        float ts = 22 * unit;
-        Text(dl, ts, ImVec2(L.x + L.pad, top + (headerH - ts) * 0.5f), bw::White, "DEATH PROBE");
-        dl->AddLine(ImVec2(L.x + L.pad * 0.5f, top + headerH - 1 * unit), ImVec2(L.x + L.w - L.pad * 0.5f, top + headerH - 1 * unit), bw::White, 1.5f * unit);
+    void DrawMenu(ImDrawList* dl, float unit, float text) {
+        bool settingsPage = menu::g_Page == Page::Settings;
+        int count = settingsPage ? SettingsCount : MainCount;
+        float fs = 20 * unit * text;
+        /* 文字を大きくしたときに行からはみ出さないよう、行の高さと幅も文字に合わせて広げる */
+        float rowH = (fs + 24 * unit) > 44 * unit ? (fs + 24 * unit) : 44 * unit;
+        Layout L{ 36 * unit, 460 * unit * (text > 1.0f ? text : 1.0f), unit, rowH, 18 * unit, fs };
 
-        uintptr_t mainStart = exl::util::modules::GetTargetStart();
-        float y = top + headerH;
-        char buf[64];
-        for (int i = 0; i < probe::Count; i++, y += L.rowH) {
-            u64 n = g_ChromaProbe[i].count - probe::g_Base[i];
-            u64 lr = g_ChromaProbe[i].lastLr;
-            snprintf(buf, sizeof(buf), "%llu  <%lx", (unsigned long long) n, (unsigned long) (lr ? lr - mainStart : 0));
-            DrawRow(dl, L, y, false, probe::Defs[i].name, buf);
-        }
-        DrawRow(dl, L, y, menu::g_Cursor == 0, "RESET COUNTS", nullptr);
-        Text(dl, 13 * unit, ImVec2(L.x + L.pad, top + h - 22 * unit), bw::Gray, "L RESET   L-STICK LEFT BACK");
-    }
-
-    void DrawSearchPage(ImDrawList* dl, float unit) {
-        int results = SearchResultsShown();
-        Layout L{ 36 * unit, 560 * unit, unit, 32 * unit, 16 * unit, 17 * unit };
-        float headerH = 48 * unit, statusH = 30 * unit, footerH = 30 * unit;
-        float h = headerH + L.rowH * (SearchItemCount + results) + statusH + footerH;
-        float top = 24 * unit;
-
-        float alpha = Clamp01(menu::g_OpenTime / 0.15f);
-        dl->AddRectFilled(ImVec2(L.x, top), ImVec2(L.x + L.w, top + h), pal::WithAlpha(bw::Panel, 0.9f * alpha));
-        dl->AddRect(ImVec2(L.x, top), ImVec2(L.x + L.w, top + h), bw::White, 0, 0, 2 * unit);
-        float ts = 22 * unit;
-        Text(dl, ts, ImVec2(L.x + L.pad, top + (headerH - ts) * 0.5f), bw::White, "VALUE SEARCH");
-        dl->AddLine(ImVec2(L.x + L.pad * 0.5f, top + headerH - 1 * unit), ImVec2(L.x + L.w - L.pad * 0.5f, top + headerH - 1 * unit), bw::White, 1.5f * unit);
-
-        /* 見出しの右側に、大きく件数(状態)を出す */
-        char buf[96];
-        {
-            if (search::Busy()) snprintf(buf, sizeof(buf), "SEARCHING %d%%", (int) (search::Progress() * 100.0f));
-            else if (search::g_TooMany) snprintf(buf, sizeof(buf), "TOO MANY");
-            else if (!search::g_HasScan) snprintf(buf, sizeof(buf), "FOUND: -");
-            else snprintf(buf, sizeof(buf), "FOUND: %d", search::g_Count);
-            float fs = 22 * unit;
-            float fw = TextW(fs, buf);
-            float bx1 = L.x + L.w - L.pad * 0.5f, bx0 = bx1 - fw - 20 * unit;
-            float by0 = top + 8 * unit, by1 = top + headerH - 8 * unit;
-            dl->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1), bw::White);
-            Text(dl, fs, ImVec2(bx0 + 10 * unit, (by0 + by1) * 0.5f - fs * 0.5f), bw::Black, buf);
-        }
-
-        float y = top + headerH;
-        for (int i = 0; i < SearchItemCount; i++, y += L.rowH) {
-            const char* val = nullptr;
-            if (i == 0) { snprintf(buf, sizeof(buf), "< %d >", search::g_Value); val = buf; }
-            if (i == 1) val = search::g_AlsoRatio ? "ON" : "OFF";
-            DrawRow(dl, L, y, menu::g_Cursor == i, SearchItems[i], val);
-        }
-
-        /* 結果(6件以下になったら一覧。L で固定 ON/OFF) */
-        for (int r = 0; r < results; r++, y += L.rowH) {
-            const search::Cand& c = search::g_Cands[r];
-            u32 v = c.last;
-            {
-                MemoryInfo mi{}; u32 pi;
-                if (R_SUCCEEDED(svcQueryMemory(&mi, &pi, c.addr)) && search::Searchable(mi)) v = *reinterpret_cast<const volatile u32*>(c.addr);
-            }
-            char vs[24];
-            if (c.kind == search::S32) snprintf(vs, sizeof(vs), "%d", (int) (s32) v);
-            else { float f; std::memcpy(&f, &v, 4); snprintf(vs, sizeof(vs), "%.3f", f); }
-            uintptr_t vt = 0, field = 0;
-            char owner[40] = "VT ?";
-            if (search::FindOwner(c.addr, vt, field)) snprintf(owner, sizeof(owner), "VT %lx +%lx", (unsigned long) vt, (unsigned long) field);
-            const char* kind = c.kind == search::S32 ? "INT" : (c.kind == search::F32 ? "FLT" : "1.0");
-            snprintf(buf, sizeof(buf), "%s %s  %s", kind, vs, owner);
-            DrawRow(dl, L, y, menu::g_Cursor == SearchItemCount + r, buf, c.lock ? "LOCK" : nullptr);
-        }
-
-        /* 状態 */
-        float gs = 14 * unit;
-        float sy = y + 6 * unit;
-        if (search::Busy()) snprintf(buf, sizeof(buf), "SEARCHING...  %d%%", (int) (search::Progress() * 100.0f));
-        else if (search::g_TooMany) snprintf(buf, sizeof(buf), "TOO MANY RESULTS - TURN 'ALSO 1.0' OFF OR CHANGE VALUE");
-        else if (!search::g_HasScan) snprintf(buf, sizeof(buf), "SET VALUE, THEN NEW SCAN");
-        else snprintf(buf, sizeof(buf), "FOUND: %d", search::g_Count);
-        Text(dl, gs, ImVec2(L.x + L.pad, sy), IsOnline() ? bw::Gray : bw::White, buf);
-
-        const char* guide = IsOnline() ? "ONLINE: LOCK DISABLED" : "L SELECT   D-PAD ADJUST   L-STICK LEFT BACK";
-        Text(dl, 13 * unit, ImVec2(L.x + L.pad, top + h - 22 * unit), bw::Gray, guide);
-    }
-
-    void DrawMenu(ImDrawList* dl, float unit) {
-        if (menu::g_Page == Page::Search) { DrawSearchPage(dl, unit); return; }
-        if (menu::g_Page == Page::Probe) { DrawProbePage(dl, unit); return; }
-        bool colorPage = menu::g_Page == Page::Color;
-        int count = colorPage ? ColorCount : MainCount;
-        Layout L{ 36 * unit, 460 * unit, unit, 44 * unit, 18 * unit, 20 * unit };
-
-        float headerH = 54 * unit;
-        float previewH = colorPage ? 70 * unit : 0.0f;
-        float footerH = (sync::Indexing() ? 54 : 34) * unit;
-        float h = headerH + L.rowH * count + previewH + footerH;
+        float ts = 26 * unit * text;
+        float headerH = ts + 28 * unit;
+        float gs = 13 * unit * text;
+        float footerH = gs + 21 * unit;
+        float h = headerH + L.rowH * count + footerH;
         float top = 30 * unit;
 
         float alpha = Clamp01(menu::g_OpenTime / 0.15f);
-        ImU32 panel = pal::WithAlpha(bw::Panel, 0.9f * alpha);
-
-        /* 本体(長方形) + 白い枠 */
-        dl->AddRectFilled(ImVec2(L.x, top), ImVec2(L.x + L.w, top + h), panel);
+        dl->AddRectFilled(ImVec2(L.x, top), ImVec2(L.x + L.w, top + h), pal::WithAlpha(bw::Panel, 0.9f * alpha));
         dl->AddRect(ImVec2(L.x, top), ImVec2(L.x + L.w, top + h), bw::White, 0, 0, 2 * unit);
 
-        /* ヘッダー: タイトル + 区切り線 */
-        const char* title = colorPage ? "INK COLOR" : "CHROMA RUSH";
-        float ts = 26 * unit;
+        const char* title = settingsPage ? "SETTINGS" : "CHROMA RUSH";
         Text(dl, ts, ImVec2(L.x + L.pad, top + (headerH - ts) * 0.5f), bw::White, title);
-        if (colorPage) {
-            const char* sub = "< L-STICK";
-            float ss = 14 * unit;
-            Text(dl, ss, ImVec2(L.x + L.w - L.pad - TextW(ss, sub), top + (headerH - ss) * 0.5f), bw::Gray, sub);
-        }
         dl->AddLine(ImVec2(L.x + L.pad * 0.5f, top + headerH - 1 * unit), ImVec2(L.x + L.w - L.pad * 0.5f, top + headerH - 1 * unit), bw::White, 1.5f * unit);
 
         float y = top + headerH;
-        if (!colorPage) {
-            for (int i = 0; i < MainCount; i++, y += L.rowH) {
-                DrawRow(dl, L, y, menu::g_Cursor == i, MainItems[i], i <= 2 ? ">" : nullptr);
-            }
+        char buf[48];
+        if (!settingsPage) {
+            for (int i = 0; i < MainCount; i++, y += L.rowH) DrawRow(dl, L, y, menu::g_Cursor == i, MainItems[i], ">");
         } else {
-            TeamOverride& o = g_Teams[menu::g_Team];
-            Picker& p = GetPicker(menu::g_Team);
-
-            DrawRow(dl, L, y, menu::g_Cursor == 0, ColorItems[0], menu::g_Team == 0 ? "< ALPHA >" : "< BRAVO >"); y += L.rowH;
-            DrawRow(dl, L, y, menu::g_Cursor == 1, ColorItems[1], o.enabled ? "ON" : "OFF");                    y += L.rowH;
-            DrawBarRow(dl, L, y, menu::g_Cursor == 2, ColorItems[2], p.hue,
-                       [&](ImVec2 b0, ImVec2 b1) { DrawRainbow(dl, b0, b1); });                             y += L.rowH;
-            DrawBarRow(dl, L, y, menu::g_Cursor == 3, ColorItems[3], (p.shade + 1.0f) * 0.5f,
-                       [&](ImVec2 b0, ImVec2 b1) { DrawShadeBar(dl, b0, b1, p.hue); });                   y += L.rowH;
-
-            /* プレビュー: NOW → NEW */
-            teamcolor::Color4f* base = GetBaseColor(menu::g_Team);
-            ImU32 nowCol = base ? ImGui::GetColorU32(ImVec4(base->r, base->g, base->b, 1.0f)) : bw::Gray;
-            ImU32 newCol = ImGui::GetColorU32(ImVec4(o.color[0], o.color[1], o.color[2], 1.0f));
-            float sz = 34 * unit;
-            float cy = y + (previewH - sz) * 0.5f - 4 * unit;
-            float cx = L.x + L.w * 0.5f;
-            ImVec2 n0(cx - 90 * unit - sz * 0.5f, cy), w0(cx + 90 * unit - sz * 0.5f, cy);
-            dl->AddRectFilled(n0, ImVec2(n0.x + sz, n0.y + sz), nowCol);
-            dl->AddRect(n0, ImVec2(n0.x + sz, n0.y + sz), bw::White, 0, 0, 1.5f * unit);
-            dl->AddRectFilled(w0, ImVec2(w0.x + sz, w0.y + sz), newCol);
-            dl->AddRect(w0, ImVec2(w0.x + sz, w0.y + sz), bw::White, 0, 0, 1.5f * unit);
-            float ls = 13 * unit;
-            Text(dl, ls, ImVec2(n0.x + (sz - TextW(ls, "NOW")) * 0.5f, n0.y + sz + 4 * unit), bw::Gray, "NOW");
-            Text(dl, ls, ImVec2(w0.x + (sz - TextW(ls, "NEW")) * 0.5f, w0.y + sz + 4 * unit), bw::Gray, "NEW");
-            Text(dl, 18 * unit, ImVec2(cx - TextW(18 * unit, ">") * 0.5f, cy + sz * 0.5f - 9 * unit), bw::White, ">");
-            y += previewH;
+            snprintf(buf, sizeof(buf), "< %s >", fonts::Names[settings::g_Font]);
+            DrawRow(dl, L, y, menu::g_Cursor == 0, SettingsItems[0], buf); y += L.rowH;
+            snprintf(buf, sizeof(buf), "< %d%% >", settings::g_MenuScale);
+            DrawRow(dl, L, y, menu::g_Cursor == 1, SettingsItems[1], buf); y += L.rowH;
+            snprintf(buf, sizeof(buf), "< %d%% >", settings::g_TextScale);
+            DrawRow(dl, L, y, menu::g_Cursor == 2, SettingsItems[2], buf); y += L.rowH;
+            DrawRow(dl, L, y, menu::g_Cursor == 3, SettingsItems[3], nullptr); y += L.rowH;
         }
 
-        /* 下: 同期の進み具合 + 操作ガイド */
-        float gs = 13 * unit;
-        float gy = top + h - 22 * unit;
-        if (sync::Indexing()) {
-            char sbuf[40];
-            snprintf(sbuf, sizeof(sbuf), "PREPARING COLORS  %d%%", (int) (sync::Progress() * 100.0f));
-            Text(dl, gs, ImVec2(L.x + L.pad, gy - 20 * unit), bw::White, sbuf);
-        }
-        const char* guide = colorPage ? "L SELECT   D-PAD ADJUST   L-STICK LEFT BACK" : "L SELECT   L-STICK LEFT CLOSE";
-        Text(dl, gs, ImVec2(L.x + L.pad, gy), bw::Gray, guide);
+        const char* guide = settingsPage ? "D-PAD LEFT/RIGHT CHANGE   L-STICK LEFT BACK" : "L SELECT   L-STICK LEFT CLOSE";
+        Text(dl, gs, ImVec2(L.x + L.pad, top + h - footerH + 8 * unit), bw::Gray, guide);
     }
 
-    void OnPreInit() {}
+    void OnPreInit() {
+        fonts::OnPreInit();
+    }
 
     void OnPostInit() {
-        ImGui::GetIO().FontGlobalScale = 1.4f;
+        fonts::OnPostInit();
         intro::Restart();
     }
 
-    void OnNewFrame() {
-        ImGuiIO& io = ImGui::GetIO();
-        ApplyTeamColors(io.DeltaTime > 0.0f && io.DeltaTime < 0.25f ? io.DeltaTime : (1.0f / 60.0f));
-        search::ApplyLocks();
-    }
+    void OnNewFrame() {}
 
     void OnRender() {
+        /* 設定は最初の描画のときに読む(SD の準備ができてから) */
+        if (!settings::g_Loaded && !intro::g_Active) settings::Load();
+
         /* ロード画面の間はメニューを出さない */
         if (intro::Draw()) return;
 
         ImGuiIO& io = ImGui::GetIO();
         float dt = io.DeltaTime > 0.0f && io.DeltaTime < 0.25f ? io.DeltaTime : (1.0f / 60.0f);
-        float unit = io.DisplaySize.y / 720.0f;
+        float unit = io.DisplaySize.y / 720.0f * (settings::g_MenuScale / 100.0f);
+        float text = settings::g_TextScale / 100.0f;
         ImDrawList* dl = ImGui::GetForegroundDrawList();
 
         if (!IsMenuOpen()) {
+            if (menu::g_WasOpen && settings::g_Dirty) settings::Save();
             menu::g_WasOpen = false;
-            DrawClosedTab(dl, unit);
+            DrawClosedTab(dl, unit, text);
             return;
         }
 
@@ -1432,8 +468,8 @@ namespace chroma {
         }
         menu::g_OpenTime += dt;
 
-        HandleInput(dt);
-        if (IsMenuOpen()) DrawMenu(dl, unit);
+        HandleInput();
+        if (IsMenuOpen()) DrawMenu(dl, unit, text);
     }
 
 }
@@ -1503,27 +539,6 @@ DEFINE_PAD_HOOK(PadJoyDualHook,  NpadJoyDualState,  2);
 DEFINE_PAD_HOOK(PadJoyLeftHook,  NpadJoyLeftState,  3);
 DEFINE_PAD_HOOK(PadJoyRightHook, NpadJoyRightState, 4);
 
-/* チームの色をセットする関数 (main 0x13cb40c) */
-HOOK_DEFINE_TRAMPOLINE(TeamColorSetHook) {
-    static void CallOrig(chroma::teamcolor::Color4f* block, const chroma::teamcolor::Color4f* color, u64 a, u64 b, float f) {
-        Orig(block, color, a, b, f);
-    }
-
-    static void Callback(chroma::teamcolor::Color4f* block, const chroma::teamcolor::Color4f* color, u64 a, u64 b, float f) {
-        chroma::OnSetBlock(block, color, a, b, f);
-    }
-};
-
-/* 材質にチームの色を書く処理 (main 0x1346ba0) */
-HOOK_DEFINE_TRAMPOLINE(PaintColorParamHook) {
-    static void CallOrig(void* self, void* arg, void* state) { Orig(self, arg, state); }
-
-    static void Callback(void* self, void* arg, void* state) {
-        Orig(self, arg, state);
-        chroma::paint::Record(self, arg, state);
-    }
-};
-
 /* nvnBootstrapLoader は sdk から公開されている。 */
 extern "C" void* nvnBootstrapLoader(const char* name);
 
@@ -1546,14 +561,6 @@ extern "C" void exl_main(void* x0, void* x1) {
     imgui_xeno_init(&chroma::OnPostInit, &chroma::OnRender);
 
     NvnBootstrapHook::InstallAtFuncPtr(nvnBootstrapLoader);
-
-    chroma::g_OrigSetBlock = &TeamColorSetHook::CallOrig;
-    TeamColorSetHook::InstallAtOffset(0x13cb40c);
-
-    chroma::paint::g_Orig = &PaintColorParamHook::CallOrig;
-    PaintColorParamHook::InstallAtOffset(0x1346ba0);
-
-    chroma::probe::Install();
 
     /* 実機調査用の記録(ヒーローモード / サイドオーダー / 機内モード中だけ記録) */
     chroma::recorder::Install();

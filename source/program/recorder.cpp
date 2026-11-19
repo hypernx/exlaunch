@@ -15,6 +15,7 @@
 #include "game.hpp"
 #include "guard.hpp"
 #include "recorder.hpp"
+#include "storage.hpp"
 #include <atomic>
 #include <cstring>
 #include <cstdio>
@@ -195,7 +196,7 @@ namespace {
         // ゲームの初期化が終わるまで待つ
         nn::os::SleepThread(nn::TimeSpan::FromSeconds(10));
 
-        if (R_FAILED(nn::fs::MountSdCardForDebug("sd"))) return;
+        if (!chroma::storage::EnsureSdMounted()) return;
         nn::fs::CreateDirectory(kDir);
         nn::fs::DeleteFile(kBin);
         if (R_SUCCEEDED(nn::fs::CreateFile(kBin, 0)) &&
